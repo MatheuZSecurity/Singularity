@@ -259,7 +259,7 @@ static struct ftrace_hook lkrg_hooks[] = {
     HOOK("p_call_usermodehelper_ret", hook_p_call_usermodehelper_ret, &orig_p_call_usermodehelper_ret),
 };
 
-static int try_install_hooks(void)
+notrace static int try_install_hooks(void)
 {
     int i, installed = 0;
     
@@ -277,7 +277,7 @@ static int try_install_hooks(void)
     return -ENOENT;
 }
 
-static int module_notify(struct notifier_block *nb, unsigned long action, void *data)
+notrace static int module_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
     if (action == MODULE_STATE_COMING) {
         atomic_set(&lkrg_initializing, 1);
