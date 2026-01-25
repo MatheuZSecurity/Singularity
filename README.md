@@ -10,6 +10,8 @@
 
 **EDR Evasion Case Study**: [Bypassing Elastic EDR with Singularity](https://matheuzsecurity.github.io/hacking/bypassing-elastic/)
 
+**POC Video: Singularity vs eBPF security tools**: [Singularity vs eBPF security tools](https://www.youtube.com/watch?v=ByEp137w3Ks)
+
 ## What is Singularity?
 
 Singularity is a sophisticated rootkit that operates at the kernel level, providing:
