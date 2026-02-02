@@ -1,5 +1,40 @@
 # Changelog
 
+## [Released] - 2026-02-02
+
+### Changed
+
+**LKRG Bypass Module - Complete Rewrite**
+- Removed all LKRG internal function hooks (p_cmp_creds, p_cmp_tasks, p_check_integrity, etc.)
+- New approach: hook kernel functions that LKRG uses instead of LKRG's own functions
+- Direct manipulation of LKRG's global control structure (p_lkrg_global_ctrl)
+- Memory offset-based control disable/restore (UMH validation, enforcement, PINT validation/enforcement)
+- Hooks now target: vprintk_emit, signal functions (do_send_sig_info, send_sig_info, __send_signal_locked, force_sig), usermodehelper functions (call_usermodehelper_exec_async, call_usermodehelper_exec)
+- Log filtering system intercepts and suppresses LKRG kernel messages
+- SIGKILL interception prevents LKRG from killing hidden processes
+- UMH protection bypass during usermode helper execution
+- Automatic LKRG detection via symbol presence check
+- Module notifier waits for LKRG load then locates control structure
+
+**Technical Changes:**
+- Removed 12 LKRG-internal hooks
+- Added 7 kernel function hooks
+- Added LKRG control structure offsets (UMH_VALIDATE: 0x30, UMH_ENFORCE: 0x34, PINT_VALIDATE: 0x08, PINT_ENFORCE: 0x0c)
+- Added log buffer (512 bytes) with spinlock protection
+- Added saved state variables for control restoration
+- PID extraction from log messages for filtering
+- Enhanced lineage checking (up to 64 levels)
+
+### Impact
+
+This version shifts from hooking LKRG's detection functions to disabling LKRG's protections at the source:
+- More reliable bypass via direct control structure manipulation
+- Prevents LKRG from detecting integrity violations instead of hiding from checks
+- Suppresses all LKRG kernel log output for hidden processes
+- Blocks LKRG from terminating hidden processes via signal interception
+- Cleaner UMH bypass with automatic enable/disable during execution
+- Better compatibility across LKRG versions (fewer internal function dependencies)
+
 ## [Released] - 2026-01-20
 
 ### Added
