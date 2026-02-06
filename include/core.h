@@ -49,4 +49,19 @@
 #include <net/sock.h>
 #include <linux/audit.h>
 #include <net/net_namespace.h>
+#include <linux/syslog.h>
+#include <linux/vmalloc.h>
+#include <linux/genetlink.h>
+#include <net/genetlink.h>
+#include <linux/taskstats.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_conntrack.h>
+#include <linux/sock_diag.h>
+#include <linux/inet_diag.h>
+#include <net/tcp.h>
+#include <net/udp.h>
+#include <linux/kallsyms.h>
+#include <linux/printk.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
 #endif
