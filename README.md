@@ -12,6 +12,8 @@
 
 **POC Video: Singularity vs eBPF security tools**: [Singularity vs eBPF security tools](https://www.youtube.com/watch?v=ByEp137w3Ks)
 
+**Breaking eBPF Security with Singularity hooks**: [Breaking eBPF](https://matheuzsecurity.github.io/hacking/ebpf-security-tools-hacking/)
+
 ## What is Singularity?
 
 Singularity is a sophisticated rootkit that operates at the kernel level, providing:
