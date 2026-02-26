@@ -1,5 +1,38 @@
 # Changelog
 
+## [Released] - 2026-02-26
+
+### Added
+
+**SysRq Hook Module** (`sysrq_hook.c`) - New module to suppress hidden processes from kernel SysRq debug output (Alt+SysRq+T, Alt+SysRq+M, etc.)
+- Hook on `sched_show_task` - suppresses hidden tasks from appearing in SysRq-T thread dumps
+- Hook on `dump_header` - replaces the OOM dump task list with a filtered version that omits hidden processes
+- Hook on `print_task.isra.0` / `print_task` - filters hidden tasks from scheduler debug output
+- Fast-path check: hooks are no-ops when no PIDs are hidden (zero overhead in idle state)
+- Full process tree traversal (up to 4096 parent levels) to hide child processes transitively
+- Graceful symbol resolution: tries `print_task.isra.0` first, falls back to `print_task`
+- Individual install tracking per hook; partial failures are cleaned up safely
+
+### Changed
+
+**Hidden PIDs - Thread Safety & API Expansion** (`hidden_pids.c` / `hidden_pids.h`)
+- Added global `hidden_pids_lock` spinlock protecting all accesses to `hidden_pids[]`, `child_pids[]`, `hidden_count`, and `child_count`
+- All four PID operations (`add_hidden_pid`, `is_hidden_pid`, `add_child_pid`, `is_child_pid`) now acquire/release the spinlock with IRQ-save semantics (`spin_lock_irqsave` / `spin_unlock_irqrestore`)
+- Early-return paths inside locked sections converted to `goto out` to guarantee lock release
+- Added input validation: PIDs ≤ 0 are rejected before the lock is even acquired
+- Added `is_hidden_pid` / `is_child_pid` loop `break` after match to avoid unnecessary iterations under lock
+- New exported functions:
+  - `hidden_pid_count()` - returns current number of hidden PIDs (lock-safe)
+  - `child_pid_count()` - returns current number of child PIDs (lock-safe)
+  - `hidden_pids_snapshot(int *dst, int max_entries)` - copies hidden PID array under lock into caller buffer
+  - `child_pids_snapshot(int *dst, int max_entries)` - copies child PID array under lock into caller buffer
+- All new functions marked `notrace` to stay out of ftrace visibility
+
+### Impact
+
+- **SysRq Hardening**: Hidden processes no longer appear in `Alt+SysRq+T` (task list), `Alt+SysRq+M` (OOM dump), or `/proc/sysrq-trigger` equivalent outputs - closes a significant forensic visibility gap
+- **Race Condition Fix**: PID list operations are now safe under concurrent access (SMP, interrupt context) - eliminates potential data corruption when multiple hooks touch the PID arrays simultaneously
+
 ## [Released] - 2026-02-02
 
 ### Changed
