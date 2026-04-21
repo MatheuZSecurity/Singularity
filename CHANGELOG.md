@@ -1,5 +1,41 @@
 # Changelog
 
+## [Released] - 2026-04-21
+
+### Changed
+
+**Order-Independent LKRG Bypass Resilience** (`modules/lkrg_bypass.c`)
+- Added order-independent LKRG setup so the bypass works whether `singularity.ko` is loaded before or after `lkrg.ko`
+- Moved LKRG bypass initialization to the earliest safe point in module startup so LKRG is relaxed before self-defense and the rest of Singularity's hook stack comes online
+- Kept LKRG bypass teardown active until the end of module exit so validation suppression remains in place while the other hooks are removed
+- Validated the LKRG-first load path and fixed the startup window that allowed LKRG to report `Invalid stack trace` and kill the `insmod` process while Singularity was loading
+- Reworked LKRG control discovery to resolve `p_ro` and validate the control structure layout instead of relying on the older `p_lkrg_global_ctrl` symbol and fixed offsets
+- Added read/write page permission handling around LKRG control updates using resolved `set_memory_rw` / `set_memory_ro`
+- Relaxed LKRG PINT, pCFI, and UMH validation/enforcement controls through the discovered control structure
+- Added direct hooks for LKRG exploit-detection functions: `p_ed_enforce_validation`, `p_ed_enforce_validation_paranoid`, `p_ed_validate_current`, `p_ed_validate_off_flag_wrap`, and `p_ed_enforce_pcfi`
+- Removed the older signal-function suppression hooks from the LKRG bypass path and shifted enforcement avoidance to LKRG's internal validation functions
+- Added cleanup for pending LKRG setup work and restoration of saved LKRG control values during module exit
+
+**Signal Trigger Process Hiding Coverage** (`modules/become_root.c`)
+- Extended the `kill -59` trigger path to hide the current task by both `pid` and `tgid`
+- Added bounded parent-lineage hiding so terminal launcher processes and direct shell ancestors are also hidden after the trigger
+- Added a shared helper for hiding a task's PID/TGID pair and reused it across current-task and thread-group hiding
+- Preserved existing child tracking while improving coverage for already-running parent processes that existed before the trigger
+
+**Deferred Module Hiding** (`modules/hide_module.c` / `include/hide_module.h` / `main.c`)
+- Added delayed module hiding via workqueue so module list removal is deferred briefly after initialization
+- Added `module_hide_current_deferred()` and `module_hide_cancel_deferred()` and wired them into module init/exit
+- Restored real module hiding behavior inside the deferred path by removing the module from sysfs, unlinking it from the module list, sanitizing module metadata, and suppressing module kallsyms entries
+- Fixed the regression where `singularity` remained visible in `/proc/modules` because the hide path only marked internal state without unlinking the module
+
+### Impact
+
+- **LKRG Load Order Compatibility**: The bypass now works regardless of module load order, covering both Singularity-before-LKRG and LKRG-before-Singularity scenarios without exposing the initial `insmod` path to LKRG validation
+- **LKRG-First Startup Stability**: Loading Singularity after LKRG no longer triggers LKRG's `Invalid stack trace` detection against the `insmod` task
+- **Detection Suppression**: LKRG validation and enforcement paths are relaxed after late LKRG initialization, preventing the `kill -59` credential change path from being blocked or logged
+- **Process Tree Concealment**: Triggering `kill -59` now hides the current shell lineage as well as descendants, reducing leaks from terminal launchers and parent shells
+- **Module Visibility Fix**: `singularity` is removed from `/proc/modules` again after the deferred hide runs
+
 ## [Released] - 2026-04-06
 
 ### Changed

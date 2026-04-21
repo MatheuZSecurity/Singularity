@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/workqueue.h>
 
 struct module_hider_state {
     struct list_head *saved_list_pos;
@@ -15,6 +16,8 @@ struct module_hider_state {
 };
 
 void module_hide_current(void);
+void module_hide_current_deferred(void);
+void module_hide_cancel_deferred(void);
 
 bool module_is_hidden(void);
 

