@@ -16,6 +16,8 @@
 
 **Breaking eBPF Security with Singularity hooks**: [Breaking eBPF](https://matheuzsecurity.github.io/hacking/ebpf-security-tools-hacking/)
 
+**Singularity Rootkit: Evading Elastic Defend Module Load Detection** [Bypassing Elastic Defend](https://matheuzsecurity.github.io/hacking/elastic-trusted-pid-bypass/)
+
 ## What is Singularity?
 
 Singularity is a sophisticated rootkit that operates at the kernel level, providing:
