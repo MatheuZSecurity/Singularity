@@ -31,7 +31,7 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - **Remote Access**: ICMP-triggered reverse shell with automatic hiding
 - **Anti-Detection**: Evade eBPF-based runtime security tools (Falco, Tracee), bypass Linux Kernel Runtime Guard (LKRG), and prevent io_uring bypass attempts
 - **Audit Evasion**: Drop audit messages for hidden processes at netlink level with statistics tracking and socket inode filtering
-- **Memory Forensics Evasion**: Filter /proc/kcore, /proc/kallsyms, /proc/vmallocinfo
+- **Memory Forensics Evasion**: Block LiME and AVML acquisition; zero module pages and hidden task_structs in physical dumps; filter /proc/kcore, /proc/kallsyms, /proc/vmallocinfo
 - **Cgroup Filtering**: Filter hidden PIDs from cgroup.procs
 - **Syslog Evasion**: Hook do_syslog to filter klogctl() kernel ring buffer access
 - **Debugfs Evasion**: Filter output of tools like debugfs that read raw block devices
@@ -62,7 +62,8 @@ Singularity is a sophisticated rootkit that operates at the kernel level, provid
 - Socket inode tracking for comprehensive network hiding
 - Cgroup PID filtering to prevent detection via `/sys/fs/cgroup/*/cgroup.procs`
 - TaskStats netlink blocking to prevent PID enumeration
-- /proc/kcore filtering to evade memory forensics tools (Volatility, crash, gdb)
+- Physical memory acquisition resistance: kprobe on `copy_mc_to_kernel` intercepts LiME page copies and redirects module pages and hidden task_struct ranges to zeroed buffers; AVML blocked via /proc/kcore read hook
+- /proc/kcore, /proc/kallsyms, /proc/vmallocinfo read filtering
 - do_syslog hook to filter klogctl() and prevent kernel ring buffer leaks
 - Block device output filtering to evade debugfs and similar disk forensics tools
 - journalctl -k output filtering via write hook
@@ -321,7 +322,7 @@ Complete hiding from syscalls and kernel interfaces:
 - TaskStats netlink queries (returns ESRCH)
 - Cgroup PIDs filtered from cgroup.procs
 
-Child processes automatically tracked via sched_process_fork tracepoint hook.
+Child processes automatically tracked via `sched_process_fork` tracepoint and `wake_up_new_task` hook. Thread-group members of hidden processes are covered via `pid_is_thread()` across all hiding paths.
 
 ### LKRG Bypass
 
@@ -404,7 +405,7 @@ Hidden processes and connections generate zero events visible to eBPF security t
 
 **Disk Forensics**: debugfs, e2fsck (output filtered via write hook)
 
-**Memory Forensics**: Volatility, crash, gdb (via /proc/kcore filtering)
+**Memory Forensics**: LiME (physical pages zeroed via `copy_mc_to_kernel` kprobe), AVML (blocked at /proc/kcore read), Volatility `linux.hidden_modules` / `pstree`
 
 **Network**: netstat, ss, lsof, tcpdump, wireshark, conntrack, nload, iftop, /proc/net/*
 
@@ -461,6 +462,9 @@ Hidden processes and connections generate zero events visible to eBPF security t
 | icmp_rcv | icmp.c | ICMP-triggered reverse shell with SELinux bypass |
 | taskstats_user_cmd | task.c | Block TaskStats queries for hidden PIDs |
 | sched_process_fork (tracepoint) | trace.c | Track child processes |
+| wake_up_new_task | trace.c | Track child processes (fork paths that skip the tracepoint) |
+| copy_mc_to_kernel (kprobe) | selfdefense.c | Zero module pages and hidden task_struct ranges in LiME physical dumps |
+| bpf_ringbuf_reserve_dynptr | bpf_hook.c | Suppress dynptr-based ringbuffer writes from hidden tasks |
 | kprobe_ftrace_handler | lkrg_bypass.c | Bypass LKRG kprobe detection |
 | p_cmp_creds, p_cmp_tasks | lkrg_bypass.c | Bypass LKRG credential checks |
 | p_ed_pcfi_validate_sp, p_ed_enforce_pcfi | lkrg_bypass.c | Bypass LKRG CFI validation |
@@ -484,6 +488,7 @@ Hidden processes and connections generate zero events visible to eBPF security t
 | 6.17.0-8-generic | Ubuntu 25.10 | Stable | Newer generic kernel, fully functional |
 | 6.14.0-37-generic | Ubuntu 24.04 | Stable | LKRG and Falco bypass validated |
 | 6.12.25-amd64 | Kali Linux | Stable | Kali 6.12.25-1kali1 |
+| 6.19.14+kali-amd64 | Kali Linux | Stable | LiME resistance and AVML block validated |
 
 ## The Plot
 

