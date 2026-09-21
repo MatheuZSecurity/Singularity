@@ -19,5 +19,6 @@ notrace void add_child_pid(int pid);
 notrace int is_child_pid(int pid);
 notrace void add_hidden_pid(int pid);
 notrace int is_hidden_pid(int pid);
+notrace int pid_is_thread(int tid);
 
 #endif

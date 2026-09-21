@@ -1,5 +1,40 @@
 # Changelog
 
+## [Released] - 2026-09-21
+
+### Added
+
+**Thread Group Coverage via `pid_is_thread()`** (`modules/hidden_pids.c` / `include/hidden_pids.h`)
+- Added `pid_is_thread()`: resolves a TID to its TGID and returns true when that TGID is in hidden_pids[] or child_pids[]
+- Propagated the check across audit, bpf_hook, task, open, hiding_stat, and become_root so thread-group members of hidden processes are covered uniformly
+
+**`wake_up_new_task` Hook** (`modules/trace.c`)
+- Added hook on `wake_up_new_task` as a second child-tracking path alongside the existing `sched_process_fork` tracepoint
+- Covers fork paths that do not fire the tracepoint on some kernel builds
+
+**`bpf_ringbuf_reserve_dynptr` Hook** (`modules/bpf_hook.c`)
+- Added hook on `bpf_ringbuf_reserve_dynptr` to suppress dynptr-based ringbuffer writes from hidden tasks
+- Adds coverage for sensors using the newer dynptr ringbuf API
+
+**LKRG Control Discovery Fallback** (`modules/lkrg_bypass.c`)
+- Added `ctrl_ok()` to validate candidate control structures against field-range sanity checks
+- Added `lkrg_scan_module_memory()`: walks the module address range a page at a time with `copy_from_kernel_nofault()`, looking for a single structure that passes `ctrl_ok()` plus `p_hide_lkrg`, interval and log-level constraints — returns NULL when more than one candidate is found
+- `lkrg_find_ctrl()` now falls back to `lkrg_scan_module_memory()` when the `p_ro` symbol route does not yield a valid layout
+
+### Removed
+
+**`kmap_atomic` / `kmap_local_page` Hooks** (`modules/selfdefense.c`)
+- Physical page filtering for the module's RAM range via `walk_system_ram_res` / `walk_iomem_res_desc` remains in place
+
+**`should_filter_bpf_prog_exec()` by Program Type** (`modules/bpf_hook.c`)
+- Removed prog-type based filtering from the BPF execution path; suppression is now driven by PID/TGID checks only
+
+### Impact
+
+- **Thread Hiding Completeness**: Threads of hidden processes no longer leak through audit messages, BPF telemetry, TaskStats, stat, or open checks
+- **Child Tracking Reliability**: `wake_up_new_task` closes the gap for fork paths not captured by the tracepoint
+- **LKRG Compatibility**: Control structure discovery now works on LKRG builds where `p_ro` is not exported
+
 ## [Released] - 2026-04-21
 
 ### Changed

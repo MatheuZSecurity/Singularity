@@ -39,14 +39,20 @@ static void __remove_from_module_list(struct module *mod)
 
 static void __sanitize_module_info(struct module *mod)
 {
-    mod->state = MODULE_STATE_UNFORMED;
     mod->sect_attrs = NULL;
+    memset(mod->name, 0, sizeof(mod->name));
 }
 
 static void __remove_symbols_from_kallsyms(struct module *mod)
 {
-    if (mod->kallsyms)
+    if (mod->kallsyms) {
         mod->kallsyms->num_symtab = 0;
+        mod->kallsyms->symtab = NULL;
+        mod->kallsyms->strtab = NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+        mod->kallsyms->typetab = NULL;
+#endif
+    }
 }
 
 notrace void module_hide_current(void)

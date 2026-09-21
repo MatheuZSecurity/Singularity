@@ -1,12 +1,10 @@
 #ifndef MODULE_HIDER_H
 #define MODULE_HIDER_H
 
-#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/kobject.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/list.h>
 #include <linux/workqueue.h>
 
 struct module_hider_state {

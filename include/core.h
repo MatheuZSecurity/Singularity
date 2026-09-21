@@ -66,5 +66,6 @@
 #include <linux/sched.h>
 #include <linux/atomic.h>
 #include <linux/hardirq.h>
+#include <linux/kobject.h>
 #include <linux/perf_event.h>
 #endif

