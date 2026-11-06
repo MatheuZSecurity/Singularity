@@ -1,6 +1,6 @@
 #include "../include/hide_module.h"
 
-#define MODULE_HIDE_DELAY_MS 5000
+#define MODULE_HIDE_DELAY_MS 200
 
 static struct module_hider_state hider_state = {0};
 static void module_hide_deferred_work(struct work_struct *work);
