@@ -1,4 +1,4 @@
-# Changelog
+# Changelog.
 
 ## [Released] - 2026-09-21
 
